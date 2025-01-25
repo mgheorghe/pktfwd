@@ -142,14 +142,14 @@ func main() {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
 	defer receiver.conn.Close()
+	
+	fmt.Println("Listening on %s", source)
 
 	sender, err := NewRawSender(*dst_iface, packets)
 	if err != nil {
 		log.Fatalf("Error creating sender: %v", err)
 	}
 	defer syscall.Close(sender.fd)
-
-	fmt.Println("Listening on 10.0.1.7:31982")
 
 	receiver.Start(ctx)
 	sender.Start(ctx)
