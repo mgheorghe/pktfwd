@@ -13,7 +13,7 @@ import (
 
 const (
 	ETH_P_ALL    = 0x0003
-	BUFFER_SIZE  = 1024
+	BUFFER_SIZE  = 4096
 	CHANNEL_SIZE = 1000
 )
 
@@ -136,7 +136,7 @@ func main() {
 
 	packets := make(chan Packet, CHANNEL_SIZE)
 
-	source := fmt.Sprintf("%s:%d", *dest_ip, *dest_port)
+	source := fmt.Sprintf("%s:%d", *src_ip, *src_port)
 	receiver, err := NewUDPReceiver(source, packets)
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
