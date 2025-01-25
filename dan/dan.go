@@ -1,3 +1,5 @@
+//go:build linux && mips64 && !cgo
+
 package main
 
 import (
@@ -32,12 +34,12 @@ func NewUDPReceiver(addr string, packets chan<- Packet) (*UDPReceiver, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &UDPReceiver{
 		conn:    conn,
 		packets: packets,
@@ -64,9 +66,9 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 }
 
 type RawSender struct {
-	fd       int
-	ifIndex  int
-	packets  <-chan Packet
+	fd      int
+	ifIndex int
+	packets <-chan Packet
 }
 
 func NewRawSender(ifaceName string, packets <-chan Packet) (*RawSender, error) {
@@ -108,7 +110,7 @@ func (s *RawSender) Start(ctx context.Context) {
 					fmt.Println("Received error:", packet.Err)
 					continue
 				}
-				
+
 				_, err := syscall.Write(s.fd, packet.Data)
 				if err != nil {
 					fmt.Println("Error sending data:", err)
@@ -142,7 +144,7 @@ func main() {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
 	defer receiver.conn.Close()
-	
+
 	fmt.Println("Listening on %s", source)
 
 	sender, err := NewRawSender(*dst_iface, packets)
