@@ -40,10 +40,16 @@ type UDPSender struct {
 }
 
 type Metrics struct {
-	PacketsReceived uint64
-	PacketsFiltered uint64
-	PacketsSent     uint64
-	Errors          uint64
+	RxFrames  uint64
+	RxFilter  uint64
+	TxFrames  uint64
+	RxErrors  uint64 // Receive errors
+	TxErrors  uint64 // Transmit errors
+	RxRate    uint64
+	TxRate    uint64
+	lastRx    uint64
+	lastTx    uint64
+	timestamp time.Time
 }
 
 var metrics Metrics
@@ -116,21 +122,21 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				n, _, err := syscall.Recvfrom(r.fd, buf, 0)
 				if err != nil {
 					updateMetrics(func(m *Metrics) {
-						m.Errors++
+						m.RxErrors++
 					})
 					r.packets <- Packet{Err: err}
 					continue
 				}
 
 				updateMetrics(func(m *Metrics) {
-					m.PacketsReceived++
+					m.RxFrames++
 				})
 
 				// Apply filter if specified
 				if r.filter != nil {
 					if r.filterOffset+len(r.filter) > n {
 						updateMetrics(func(m *Metrics) {
-							m.PacketsFiltered++
+							m.RxFilter++
 						})
 						continue
 					}
@@ -145,7 +151,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 
 					if !matched {
 						updateMetrics(func(m *Metrics) {
-							m.PacketsFiltered++
+							m.RxFilter++
 						})
 						continue
 					}
@@ -168,22 +174,19 @@ func (s *UDPSender) Start(ctx context.Context) {
 			case packet := <-s.packets:
 				if packet.Err != nil {
 					updateMetrics(func(m *Metrics) {
-						m.Errors++
+						m.TxErrors++
 					})
-					fmt.Println("Received error:", packet.Err)
 					continue
 				}
 				_, err := s.conn.Write(packet.Data)
 				if err != nil {
 					updateMetrics(func(m *Metrics) {
-						m.Errors++
+						m.TxErrors++
 					})
-					fmt.Println("Error sending data:", err)
 				} else {
 					updateMetrics(func(m *Metrics) {
-						m.PacketsSent++
+						m.TxFrames++
 					})
-					fmt.Println("Packet sent successfully!")
 				}
 			}
 		}
@@ -199,12 +202,36 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
+
+				// Calculate rates
+				now := time.Now()
+				duration := now.Sub(metrics.timestamp).Seconds()
+				if duration > 0 {
+					metrics.RxRate = uint64(float64(metrics.RxFrames-metrics.lastRx) / duration)
+					metrics.TxRate = uint64(float64(metrics.TxFrames-metrics.lastTx) / duration)
+				}
+
+				// Update tracking values
+				metrics.lastRx = metrics.RxFrames
+				metrics.lastTx = metrics.TxFrames
+				metrics.timestamp = now
+
 				metricsMutex.Lock()
-				fmt.Printf("Metrics - Received: %d, Filtered: %d, Sent: %d, Errors: %d\n",
-					metrics.PacketsReceived,
-					metrics.PacketsFiltered,
-					metrics.PacketsSent,
-					metrics.Errors)
+				fmt.Print("\033[H\033[2J")
+				fmt.Printf("Packets Received: %d\n"+
+					"Packets Filtered: %d\n"+
+					"Packets Sent: %d\n"+
+					"RX Errors: %d\n"+
+					"TX Errors: %d\n"+
+					"RX Rate: %d\n"+
+					"TX Rate: %d\n",
+					metrics.RxFrames,
+					metrics.RxFilter,
+					metrics.TxFrames,
+					metrics.RxErrors,
+					metrics.TxErrors,
+					metrics.RxRate,
+					metrics.TxRate)
 				metricsMutex.Unlock()
 			}
 		}
@@ -257,7 +284,6 @@ func main() {
 		startMetricsReporter(ctx, time.Second)
 	}
 
-	fmt.Printf("Forwarding packets from %s to %s\n", *src_iface, dst_addr)
 	<-sigs
 	fmt.Println("Received SIGINT. Exiting...")
 }

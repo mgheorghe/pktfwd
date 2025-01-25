@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -18,6 +20,29 @@ const (
 	BUFFER_SIZE  = 4096
 	CHANNEL_SIZE = 1000
 )
+
+type Metrics struct {
+	RxFrames  uint64
+	TxFrames  uint64
+	RxErrors  uint64 // Receive errors
+	TxErrors  uint64 // Transmit errors
+	RxRate    uint64
+	TxRate    uint64
+	lastRx    uint64
+	lastTx    uint64
+	timestamp time.Time
+}
+
+var (
+	metrics      Metrics
+	metricsMutex sync.Mutex
+)
+
+func updateMetrics(f func(*Metrics)) {
+	metricsMutex.Lock()
+	f(&metrics)
+	metricsMutex.Unlock()
+}
 
 type Packet struct {
 	Data []byte
@@ -56,9 +81,15 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 				buf := make([]byte, BUFFER_SIZE)
 				n, _, err := r.conn.ReadFromUDP(buf)
 				if err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.RxErrors++
+					})
 					r.packets <- Packet{Err: err}
 					continue
 				}
+				updateMetrics(func(m *Metrics) {
+					m.RxFrames++
+				})
 				r.packets <- Packet{Data: buf[:n]}
 			}
 		}
@@ -107,16 +138,65 @@ func (s *RawSender) Start(ctx context.Context) {
 				return
 			case packet := <-s.packets:
 				if packet.Err != nil {
-					fmt.Println("Received error:", packet.Err)
+					updateMetrics(func(m *Metrics) {
+						m.TxErrors++
+					})
 					continue
 				}
 
 				_, err := syscall.Write(s.fd, packet.Data)
 				if err != nil {
-					fmt.Println("Error sending data:", err)
+					updateMetrics(func(m *Metrics) {
+						m.TxErrors++
+					})
 				} else {
-					fmt.Println("Packet sent successfully!")
+					updateMetrics(func(m *Metrics) {
+						m.TxFrames++
+					})
 				}
+			}
+		}
+	}()
+}
+
+func startMetricsReporter(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+
+				// Calculate rates
+				now := time.Now()
+				duration := now.Sub(metrics.timestamp).Seconds()
+				if duration > 0 {
+					metrics.RxRate = uint64(float64(metrics.RxFrames-metrics.lastRx) / duration)
+					metrics.TxRate = uint64(float64(metrics.TxFrames-metrics.lastTx) / duration)
+				}
+
+				// Update tracking values
+				metrics.lastRx = metrics.RxFrames
+				metrics.lastTx = metrics.TxFrames
+				metrics.timestamp = now
+
+				metricsMutex.Lock()
+				fmt.Print("\033[H\033[2J")
+				fmt.Printf("Packets Received: %d\n"+
+					"Packets Sent: %d\n"+
+					"RX Errors: %d\n"+
+					"TX Errors: %d\n"+
+					"RX Rate: %d\n"+
+					"TX Rate: %d\n",
+					metrics.RxFrames,
+					metrics.TxFrames,
+					metrics.RxErrors,
+					metrics.TxErrors,
+					metrics.RxRate,
+					metrics.TxRate)
+				metricsMutex.Unlock()
 			}
 		}
 	}()
@@ -134,6 +214,7 @@ func main() {
 	dst_iface := flag.String("dst-iface", "eth0", "Source interface to copy packets from")
 	src_ip := flag.String("src-ip", "10.0.1.7", "Source interface to copy packets from")
 	src_port := flag.Int("src-port", 31982, "Source interface to copy packets from")
+	metrics_enabled := flag.Bool("metrics", false, "Enable metrics collection and reporting")
 	flag.Parse()
 
 	packets := make(chan Packet, CHANNEL_SIZE)
@@ -155,6 +236,11 @@ func main() {
 
 	receiver.Start(ctx)
 	sender.Start(ctx)
+
+	// Start metrics reporter (prints every 1 seconds)
+	if *metrics_enabled {
+		startMetricsReporter(ctx, time.Second)
+	}
 
 	<-sigs
 	fmt.Println("Received SIGINT. Exiting...")
