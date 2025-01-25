@@ -14,107 +14,155 @@ import (
 )
 
 const (
-	// Define the Ethernet header structure
-	ETH_P_ALL = 0x0003 // Accept all Ethernet frame types
+	ETH_P_ALL    = 0x0003
+	BUFFER_SIZE  = 2048
+	CHANNEL_SIZE = 1000
 )
 
-// Receiver packet receiver
-type Receiver interface {
-	Receive() error
+type Packet struct {
+	Data []byte
+	Err  error
 }
 
-// Sender packet sender
-type Sender interface {
-	Send() error
+type RawReceiver struct {
+	fd      int
+	ifIndex int
+	packets chan<- Packet
 }
 
-func main() {
-	fmt.Println("hello world")
+type UDPSender struct {
+	conn    *net.UDPConn
+	packets <-chan Packet
+}
 
-	// Create a channel for receiving OS signals
-	sigs := make(chan os.Signal, 1)
-
-	// Register the signal handler for SIGINT (Ctrl+C)
-	signal.Notify(sigs, syscall.SIGINT)
-
-	src_name := flag.String("src", "eth0", "Source interface to copy packets from")
-	//dst_name := flag.String("dst", "ixvnet0", "Destination interface to put raw data from source over ipv4")
-
-	src_iface, err := net.InterfaceByName(*src_name)
+func NewRawReceiver(ifaceName string, packets chan<- Packet) (*RawReceiver, error) {
+	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		fmt.Println("Error getting interface:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error getting interface: %v", err)
 	}
 
-	// dst_iface, err := net.InterfaceByName(*dst_name)
-	// if err != nil {
-	// 	fmt.Println("Error getting interface:", err)
-	// 	os.Exit(1)
-	// }
-
-	// Create a raw socket
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, syscall.ETH_P_ALL)
 	if err != nil {
-		fmt.Println("Error creating socket:", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
-	defer syscall.Close(fd)
 
-	// Bind the socket to the specific interface
 	sll := syscall.SockaddrLinklayer{
-		Ifindex:  src_iface.Index,
+		Ifindex:  iface.Index,
 		Protocol: syscall.ETH_P_ALL,
 	}
 	if err := syscall.Bind(fd, &sll); err != nil {
-		log.Fatalf("Error binding socket to interface %q: %v", *src_name, err)
+		syscall.Close(fd)
+		return nil, fmt.Errorf("error binding socket: %v", err)
 	}
 
-	// Create a buffer to receive packets
-	buf := make([]byte, 2048)
+	return &RawReceiver{
+		fd:      fd,
+		ifIndex: iface.Index,
+		packets: packets,
+	}, nil
+}
 
-	// Handle graceful shutdown
-	_, cancel := context.WithCancel(context.Background())
+func NewUDPSender(srcAddr, dstAddr string, packets <-chan Packet) (*UDPSender, error) {
+	srcUDPAddr, err := net.ResolveUDPAddr("udp", srcAddr)
+	if err != nil {
+		return nil, err
+	}
+	dstUDPAddr, err := net.ResolveUDPAddr("udp", dstAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialUDP("udp", srcUDPAddr, dstUDPAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return &UDPSender{
+		conn:    conn,
+		packets: packets,
+	}, nil
+}
+
+func (r *RawReceiver) Start(ctx context.Context) {
+	go func() {
+		buf := make([]byte, BUFFER_SIZE)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				n, _, err := syscall.Recvfrom(r.fd, buf, 0)
+				if err != nil {
+					r.packets <- Packet{Err: err}
+					continue
+				}
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				r.packets <- Packet{Data: data}
+			}
+		}
+	}()
+}
+
+func (s *UDPSender) Start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case packet := <-s.packets:
+				if packet.Err != nil {
+					fmt.Println("Received error:", packet.Err)
+					continue
+				}
+				_, err := s.conn.Write(packet.Data)
+				if err != nil {
+					fmt.Println("Error sending data:", err)
+				} else {
+					fmt.Println("Packet sent successfully!")
+				}
+			}
+		}
+	}()
+}
+
+func main() {
+	fmt.Println("Starting packet forwarder...")
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	conn, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP("10.0.1.1"), Port: 19849}, &net.UDPAddr{IP: net.ParseIP("10.0.1.7"), Port: 31982})
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT)
+
+	src_iface := flag.String("src-iface", "eth0", "Source interface to copy packets from")
+	dst_ip := flag.String("dst-ip", "10.0.1.7", "Destination UDP address")
+	dst_port := flag.Int("dst-port", 31982, "Destination UDP address")
+	src_ip := flag.String("src-ip", "10.0.1.1", "Source UDP address")
+	src_port := flag.Int("src-port", 19849, "Source UDP address")
+	flag.Parse()
+
+	dst_addr := fmt.Sprintf("%s:%d", *dst_ip, *dst_port)
+	src_addr := fmt.Sprintf("%s:%d", *src_ip, *src_port)
+
+	packets := make(chan Packet, CHANNEL_SIZE)
+
+	receiver, err := NewRawReceiver(*src_iface, packets)
 	if err != nil {
-		fmt.Println("Error creating UDP socket:", err)
-		os.Exit(1)
+		log.Fatalf("Error creating receiver: %v", err)
 	}
-	defer conn.Close()
+	defer syscall.Close(receiver.fd)
 
-	// Read packets from the socket
-	for {
-		select {
-		case <-sigs:
-			fmt.Println("Received SIGINT. Exiting...")
-			return // Exit the program gracefully
-		default:
-			n, _, err := syscall.Recvfrom(fd, buf, 0)
-			if err != nil {
-				log.Printf("Error reading from socket: %v", err)
-				continue
-			}
-
-			// Send the received packet to the destination
-			//fmt.Printf("%s", string(buf[:n]))
-			//if n > 0 {
-			_, err = conn.Write(buf[:n])
-			if err != nil {
-				fmt.Println("Error sending data:", err)
-			} else {
-				fmt.Println("Data sent successfully!")
-			}
-			//}
-			// Process the received packet (e.g., print it)
-			// for i := 0; i < n; i++ {
-			// 	fmt.Printf("%02x ", buf[i])
-			// 	if (i+1)%16 == 0 {
-			// 		fmt.Println()
-			// 	}
-			// }
-			// fmt.Println()
-		}
+	sender, err := NewUDPSender(src_addr, dst_addr, packets)
+	if err != nil {
+		log.Fatalf("Error creating sender: %v", err)
 	}
+	defer sender.conn.Close()
 
+	receiver.Start(ctx)
+	sender.Start(ctx)
+
+	fmt.Printf("Forwarding packets from %s to %s\n", *src_iface, dst_addr)
+	<-sigs
+	fmt.Println("Received SIGINT. Exiting...")
 }

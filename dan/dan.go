@@ -131,9 +131,9 @@ func main() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT)
 
-	dst_iface := flag.String("dst", "eth0", "Source interface to copy packets from")
-	src_ip := flag.String("scr-ip", "10.0.1.7", "Source interface to copy packets from")
-	src_port := flag.Int("scr-port", 31982, "Source interface to copy packets from")
+	dst_iface := flag.String("dst-iface", "eth0", "Source interface to copy packets from")
+	src_ip := flag.String("src-ip", "10.0.1.7", "Source interface to copy packets from")
+	src_port := flag.Int("src-port", 31982, "Source interface to copy packets from")
 	flag.Parse()
 
 	packets := make(chan Packet, CHANNEL_SIZE)
