@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -11,23 +12,22 @@ import (
 )
 
 const (
-	ETH_P_ALL = 0x0003
-	BUFFER_SIZE = 1024
+	ETH_P_ALL    = 0x0003
+	BUFFER_SIZE  = 1024
+	CHANNEL_SIZE = 1000
 )
 
-type Receiver interface {
-	Receive() ([]byte, error)
-}
-
-type Sender interface {
-	Send([]byte) error
+type Packet struct {
+	Data []byte
+	Err  error
 }
 
 type UDPReceiver struct {
-	conn *net.UDPConn
+	conn    *net.UDPConn
+	packets chan<- Packet
 }
 
-func NewUDPReceiver(addr string) (*UDPReceiver, error) {
+func NewUDPReceiver(addr string, packets chan<- Packet) (*UDPReceiver, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -38,28 +38,38 @@ func NewUDPReceiver(addr string) (*UDPReceiver, error) {
 		return nil, err
 	}
 	
-	return &UDPReceiver{conn: conn}, nil
+	return &UDPReceiver{
+		conn:    conn,
+		packets: packets,
+	}, nil
 }
 
-func (r *UDPReceiver) Receive() ([]byte, error) {
-	buf := make([]byte, BUFFER_SIZE)
-	n, _, err := r.conn.ReadFromUDP(buf)
-	if err != nil {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func (r *UDPReceiver) Close() error {
-	return r.conn.Close()
+func (r *UDPReceiver) Start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				buf := make([]byte, BUFFER_SIZE)
+				n, _, err := r.conn.ReadFromUDP(buf)
+				if err != nil {
+					r.packets <- Packet{Err: err}
+					continue
+				}
+				r.packets <- Packet{Data: buf[:n]}
+			}
+		}
+	}()
 }
 
 type RawSender struct {
-	fd      int
-	ifIndex int
+	fd       int
+	ifIndex  int
+	packets  <-chan Packet
 }
 
-func NewRawSender(ifaceName string) (*RawSender, error) {
+func NewRawSender(ifaceName string, packets <-chan Packet) (*RawSender, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, err
@@ -80,20 +90,41 @@ func NewRawSender(ifaceName string) (*RawSender, error) {
 		return nil, err
 	}
 
-	return &RawSender{fd: fd, ifIndex: iface.Index}, nil
+	return &RawSender{
+		fd:      fd,
+		ifIndex: iface.Index,
+		packets: packets,
+	}, nil
 }
 
-func (s *RawSender) Send(data []byte) error {
-	_, err := syscall.Write(s.fd, data)
-	return err
-}
-
-func (s *RawSender) Close() error {
-	return syscall.Close(s.fd)
+func (s *RawSender) Start(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case packet := <-s.packets:
+				if packet.Err != nil {
+					fmt.Println("Received error:", packet.Err)
+					continue
+				}
+				
+				_, err := syscall.Write(s.fd, packet.Data)
+				if err != nil {
+					fmt.Println("Error sending data:", err)
+				} else {
+					fmt.Println("Packet sent successfully!")
+				}
+			}
+		}
+	}()
 }
 
 func main() {
 	fmt.Println("decap")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT)
@@ -103,37 +134,26 @@ func main() {
 	src_port := flag.Int("scr-port", 31982, "Source interface to copy packets from")
 	flag.Parse()
 
-	receiver, err := NewUDPReceiver("%s:%d", *dest_ip, *dest_port)
+	packets := make(chan Packet, CHANNEL_SIZE)
+
+	source := fmt.Sprintf("%s:%d", *dest_ip, *dest_port)
+	receiver, err := NewUDPReceiver(source, packets)
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
-	defer receiver.Close()
+	defer receiver.conn.Close()
 
-	sender, err := NewRawSender(*dst_iface)
+	sender, err := NewRawSender(*dst_iface, packets)
 	if err != nil {
 		log.Fatalf("Error creating sender: %v", err)
 	}
-	defer sender.Close()
+	defer syscall.Close(sender.fd)
 
-	fmt.Println("Listening on %s:%d", *dest_ip, *dest_port)
+	fmt.Println("Listening on 10.0.1.7:31982")
 
-	for {
-		select {
-		case <-sigs:
-			fmt.Println("Received SIGINT. Exiting...")
-			return
-		default:
-			data, err := receiver.Receive()
-			if err != nil {
-				fmt.Println("Error receiving:", err)
-				continue
-			}
+	receiver.Start(ctx)
+	sender.Start(ctx)
 
-			if err := sender.Send(data); err != nil {
-				fmt.Println("Error sending data:", err)
-			} else {
-				fmt.Println("Packet sent successfully!")
-			}
-		}
-	}
+	<-sigs
+	fmt.Println("Received SIGINT. Exiting...")
 }
