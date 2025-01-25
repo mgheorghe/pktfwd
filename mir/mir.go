@@ -10,7 +10,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -25,9 +27,11 @@ type Packet struct {
 }
 
 type RawReceiver struct {
-	fd      int
-	ifIndex int
-	packets chan<- Packet
+	fd           int
+	ifIndex      int
+	packets      chan<- Packet
+	filter       []byte
+	filterOffset int
 }
 
 type UDPSender struct {
@@ -35,7 +39,23 @@ type UDPSender struct {
 	packets <-chan Packet
 }
 
-func NewRawReceiver(ifaceName string, packets chan<- Packet) (*RawReceiver, error) {
+type Metrics struct {
+	PacketsReceived uint64
+	PacketsFiltered uint64
+	PacketsSent     uint64
+	Errors          uint64
+}
+
+var metrics Metrics
+var metricsMutex sync.Mutex
+
+func updateMetrics(f func(*Metrics)) {
+	metricsMutex.Lock()
+	f(&metrics)
+	metricsMutex.Unlock()
+}
+
+func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int) (*RawReceiver, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("error getting interface: %v", err)
@@ -56,9 +76,11 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet) (*RawReceiver, erro
 	}
 
 	return &RawReceiver{
-		fd:      fd,
-		ifIndex: iface.Index,
-		packets: packets,
+		fd:           fd,
+		ifIndex:      iface.Index,
+		packets:      packets,
+		filter:       filter,
+		filterOffset: filterOffset,
 	}, nil
 }
 
@@ -93,9 +115,42 @@ func (r *RawReceiver) Start(ctx context.Context) {
 			default:
 				n, _, err := syscall.Recvfrom(r.fd, buf, 0)
 				if err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.Errors++
+					})
 					r.packets <- Packet{Err: err}
 					continue
 				}
+
+				updateMetrics(func(m *Metrics) {
+					m.PacketsReceived++
+				})
+
+				// Apply filter if specified
+				if r.filter != nil {
+					if r.filterOffset+len(r.filter) > n {
+						updateMetrics(func(m *Metrics) {
+							m.PacketsFiltered++
+						})
+						continue
+					}
+
+					matched := true
+					for i := 0; i < len(r.filter); i++ {
+						if buf[r.filterOffset+i] != r.filter[i] {
+							matched = false
+							break
+						}
+					}
+
+					if !matched {
+						updateMetrics(func(m *Metrics) {
+							m.PacketsFiltered++
+						})
+						continue
+					}
+				}
+
 				data := make([]byte, n)
 				copy(data, buf[:n])
 				r.packets <- Packet{Data: data}
@@ -112,15 +167,45 @@ func (s *UDPSender) Start(ctx context.Context) {
 				return
 			case packet := <-s.packets:
 				if packet.Err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.Errors++
+					})
 					fmt.Println("Received error:", packet.Err)
 					continue
 				}
 				_, err := s.conn.Write(packet.Data)
 				if err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.Errors++
+					})
 					fmt.Println("Error sending data:", err)
 				} else {
+					updateMetrics(func(m *Metrics) {
+						m.PacketsSent++
+					})
 					fmt.Println("Packet sent successfully!")
 				}
+			}
+		}
+	}()
+}
+
+func startMetricsReporter(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				metricsMutex.Lock()
+				fmt.Printf("Metrics - Received: %d, Filtered: %d, Sent: %d, Errors: %d\n",
+					metrics.PacketsReceived,
+					metrics.PacketsFiltered,
+					metrics.PacketsSent,
+					metrics.Errors)
+				metricsMutex.Unlock()
 			}
 		}
 	}()
@@ -140,14 +225,19 @@ func main() {
 	dst_port := flag.Int("dst-port", 31982, "Destination UDP address")
 	src_ip := flag.String("src-ip", "10.0.1.1", "Source UDP address")
 	src_port := flag.Int("src-port", 19849, "Source UDP address")
+	filter_str := flag.String("filter", "", "Source UDP address")
+	filter_offset := flag.Int("filter-offset", 0, "Source UDP address")
+	metrics_enabled := flag.Bool("metrics", false, "Enable metrics collection and reporting")
 	flag.Parse()
+
+	filter := []byte(*filter_str)
 
 	dst_addr := fmt.Sprintf("%s:%d", *dst_ip, *dst_port)
 	src_addr := fmt.Sprintf("%s:%d", *src_ip, *src_port)
 
 	packets := make(chan Packet, CHANNEL_SIZE)
 
-	receiver, err := NewRawReceiver(*src_iface, packets)
+	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset)
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
@@ -161,6 +251,11 @@ func main() {
 
 	receiver.Start(ctx)
 	sender.Start(ctx)
+
+	// Start metrics reporter (prints every 1 seconds)
+	if *metrics_enabled {
+		startMetricsReporter(ctx, time.Second)
+	}
 
 	fmt.Printf("Forwarding packets from %s to %s\n", *src_iface, dst_addr)
 	<-sigs
