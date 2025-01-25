@@ -111,16 +111,26 @@ func NewUDPSender(srcAddr, dstAddr string, packets <-chan Packet) (*UDPSender, e
 	}, nil
 }
 
+// Add a sync.Pool for byte buffers
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, BUFFER_SIZE)
+	},
+}
+
 func (r *RawReceiver) Start(ctx context.Context) {
 	go func() {
-		buf := make([]byte, BUFFER_SIZE)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+				// Get buffer from pool
+				buf := bufferPool.Get().([]byte)
+
 				n, _, err := syscall.Recvfrom(r.fd, buf, 0)
 				if err != nil {
+					bufferPool.Put(buf) // Return buffer to pool on error
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
@@ -135,6 +145,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				// Apply filter if specified
 				if r.filter != nil {
 					if r.filterOffset+len(r.filter) > n {
+						bufferPool.Put(buf) // Return buffer to pool if filtered
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
@@ -150,6 +161,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					}
 
 					if !matched {
+						bufferPool.Put(buf) // Return buffer to pool if filtered
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
@@ -157,14 +169,16 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					}
 				}
 
+				// Only copy data if packet passes filter
 				data := make([]byte, n)
 				copy(data, buf[:n])
+				bufferPool.Put(buf) // Return buffer to pool after copying
+
 				r.packets <- Packet{Data: data}
 			}
 		}
 	}()
 }
-
 func (s *UDPSender) Start(ctx context.Context) {
 	go func() {
 		for {
