@@ -101,10 +101,10 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 				case r.packets <- Packet{Data: buf[:n]}:
 				default:
 					// Drop packet if channel is full
-					bufferPool.Put(buf)
 					updateMetrics(func(m *Metrics) {
 						m.BufFullDrop++
 					})
+					bufferPool.Put(buf)
 				}
 			}
 		}
