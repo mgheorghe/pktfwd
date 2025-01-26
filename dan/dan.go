@@ -36,6 +36,11 @@ type Metrics struct {
 var (
 	metrics      Metrics
 	metricsMutex sync.Mutex
+	bufferPool   = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, BUFFER_SIZE)
+		},
+	}
 )
 
 func updateMetrics(f func(*Metrics)) {
@@ -78,19 +83,21 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				buf := make([]byte, BUFFER_SIZE)
+				buf := bufferPool.Get().([]byte)
 				n, _, err := r.conn.ReadFromUDP(buf)
 				if err != nil {
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
 					r.packets <- Packet{Err: err}
+					bufferPool.Put(buf)
 					continue
 				}
 				updateMetrics(func(m *Metrics) {
 					m.RxFrames++
 				})
 				r.packets <- Packet{Data: buf[:n]}
+				bufferPool.Put(buf)
 			}
 		}
 	}()

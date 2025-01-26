@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -142,6 +143,9 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					m.RxFrames++
 				})
 
+				//fmt.Printf("Buffer: %x\n", buf[:n])
+				//fmt.Printf("Filter: %x\n", r.filter)
+
 				// Apply filter if specified
 				if r.filter != nil {
 					if r.filterOffset+len(r.filter) > n {
@@ -155,6 +159,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					matched := true
 					for i := 0; i < len(r.filter); i++ {
 						if buf[r.filterOffset+i] != r.filter[i] {
+							//fmt.Printf("B: %x -> F: %x\n", buf[r.filterOffset+i], r.filter[i])
 							matched = false
 							break
 						}
@@ -271,7 +276,12 @@ func main() {
 	metrics_enabled := flag.Bool("metrics", false, "Enable metrics collection and reporting")
 	flag.Parse()
 
-	filter := []byte(*filter_str)
+	hexStr := *filter_str
+	filter, err := hex.DecodeString(hexStr)
+	if err != nil {
+		// handle error
+		log.Fatalf("Failed to decode hex string: %v", err)
+	}
 
 	dst_addr := fmt.Sprintf("%s:%d", *dst_ip, *dst_port)
 	src_addr := fmt.Sprintf("%s:%d", *src_ip, *src_port)
