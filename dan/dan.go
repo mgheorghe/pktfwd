@@ -22,15 +22,16 @@ const (
 )
 
 type Metrics struct {
-	RxFrames  uint64
-	TxFrames  uint64
-	RxErrors  uint64 // Receive errors
-	TxErrors  uint64 // Transmit errors
-	RxRate    uint64
-	TxRate    uint64
-	lastRx    uint64
-	lastTx    uint64
-	timestamp time.Time
+	RxFrames    uint64
+	TxFrames    uint64
+	RxErrors    uint64 // Receive errors
+	TxErrors    uint64 // Transmit errors
+	RxRate      uint64
+	TxRate      uint64
+	lastRx      uint64
+	lastTx      uint64
+	BufFullDrop uint64
+	timestamp   time.Time
 }
 
 var (
@@ -45,8 +46,8 @@ var (
 
 func updateMetrics(f func(*Metrics)) {
 	metricsMutex.Lock()
+	defer metricsMutex.Unlock()
 	f(&metrics)
-	metricsMutex.Unlock()
 }
 
 type Packet struct {
@@ -96,8 +97,15 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 				updateMetrics(func(m *Metrics) {
 					m.RxFrames++
 				})
-				r.packets <- Packet{Data: buf[:n]}
-				bufferPool.Put(buf)
+				select {
+				case r.packets <- Packet{Data: buf[:n]}:
+				default:
+					// Drop packet if channel is full
+					bufferPool.Put(buf)
+					updateMetrics(func(m *Metrics) {
+						m.BufFullDrop++
+					})
+				}
 			}
 		}
 	}()
@@ -175,19 +183,17 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-
-				// Calculate rates
 				now := time.Now()
 				duration := now.Sub(metrics.timestamp).Seconds()
 				if duration > 0 {
+					metricsMutex.Lock()
 					metrics.RxRate = uint64(float64(metrics.RxFrames-metrics.lastRx) / duration)
 					metrics.TxRate = uint64(float64(metrics.TxFrames-metrics.lastTx) / duration)
+					metrics.lastRx = metrics.RxFrames
+					metrics.lastTx = metrics.TxFrames
+					metrics.timestamp = now
+					metricsMutex.Unlock()
 				}
-
-				// Update tracking values
-				metrics.lastRx = metrics.RxFrames
-				metrics.lastTx = metrics.TxFrames
-				metrics.timestamp = now
 
 				metricsMutex.Lock()
 				fmt.Print("\033[H\033[2J")
@@ -196,13 +202,15 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					"RX Errors: %d\n"+
 					"TX Errors: %d\n"+
 					"RX Rate: %d\n"+
-					"TX Rate: %d\n",
+					"TX Rate: %d\n"+
+					"Drop BF: %d\n",
 					metrics.RxFrames,
 					metrics.TxFrames,
 					metrics.RxErrors,
 					metrics.TxErrors,
 					metrics.RxRate,
-					metrics.TxRate)
+					metrics.TxRate,
+					metrics.BufFullDrop)
 				metricsMutex.Unlock()
 			}
 		}
