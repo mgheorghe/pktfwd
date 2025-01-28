@@ -237,9 +237,10 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 
 				metricsMutex.Lock()
 				fmt.Print("\033[H\033[2J")
-				fmt.Printf("Packets Received: %d\n"+
-					"Packets Filtered: %d\n"+
-					"Packets Sent: %d\n"+
+				fmt.Printf(""+
+					"Rx Frames: %d\n"+
+					"Rx Filter: %d\n"+
+					"Tx Frames: %d\n"+
 					"RX Errors: %d\n"+
 					"TX Errors: %d\n"+
 					"RX Rate: %d\n"+

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -17,8 +18,8 @@ import (
 
 const (
 	ETH_P_ALL    = 0x0003
-	BUFFER_SIZE  = 4096
-	CHANNEL_SIZE = 1000
+	BUFFER_SIZE  = 8192 // Start with a moderate buffer size
+	CHANNEL_SIZE = 10000
 )
 
 type Metrics struct {
@@ -197,8 +198,9 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 
 				metricsMutex.Lock()
 				fmt.Print("\033[H\033[2J")
-				fmt.Printf("Packets Received: %d\n"+
-					"Packets Sent: %d\n"+
+				fmt.Printf(""+
+					"Rx Frames: %d\n"+
+					"Tx Frames: %d\n"+
 					"RX Errors: %d\n"+
 					"TX Errors: %d\n"+
 					"RX Rate: %d\n"+
@@ -259,4 +261,16 @@ func main() {
 
 	<-sigs
 	fmt.Println("Received SIGINT. Exiting...")
+
+	// Print memory statistics
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	fmt.Printf("Alloc = %v MiB", bToMb(memStats.Alloc))
+	fmt.Printf("\tTotalAlloc = %v MiB", bToMb(memStats.TotalAlloc))
+	fmt.Printf("\tSys = %v MiB", bToMb(memStats.Sys))
+	fmt.Printf("\tNumGC = %v\n", memStats.NumGC)
+}
+
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
 }
