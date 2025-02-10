@@ -237,14 +237,15 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 
 				metricsMutex.Lock()
 				fmt.Print("\033[H\033[2J")
-				fmt.Printf(""+
+				fmt.Printf("%s\n"+
 					"Rx Frames: %d\n"+
 					"Rx Filter: %d\n"+
 					"Tx Frames: %d\n"+
-					"RX Errors: %d\n"+
-					"TX Errors: %d\n"+
-					"RX Rate: %d\n"+
-					"TX Rate: %d\n",
+					"Rx Errors: %d\n"+
+					"Tx Errors: %d\n"+
+					"Rx Rate: %d\n"+
+					"Tx Rate: %d\n",
+					os.Args,
 					metrics.RxFrames,
 					metrics.RxFilter,
 					metrics.TxFrames,
