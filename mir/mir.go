@@ -1,4 +1,4 @@
-//go:build linux && mips64 && !cgo
+//go:build linux && !cgo
 
 package main
 

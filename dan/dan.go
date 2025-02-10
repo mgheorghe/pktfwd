@@ -1,4 +1,4 @@
-//go:build linux && mips64 && !cgo
+//go:build linux && !cgo
 
 package main
 
@@ -18,8 +18,8 @@ import (
 
 const (
 	ETH_P_ALL    = 0x0003
-	BUFFER_SIZE  = 8192 // Start with a moderate buffer size
-	CHANNEL_SIZE = 10000
+	BUFFER_SIZE  = 4096 // Start with a moderate buffer size
+	CHANNEL_SIZE = 1000
 )
 
 type Metrics struct {

@@ -20,8 +20,8 @@ go build
 
 8
 ```
-/mir --src-ip 10.0.1.8 --dst-ip 10.0.1.1 --filter 20010000000000000000000100010002 --filter-offset 38 &
 /dan --src-ip 10.0.1.1 &
+/mir --src-ip 10.0.1.8 --dst-ip 10.0.1.1 --filter 20010000000000000000000100010002 --filter-offset 38 --metrics
 ```
 
 
@@ -30,3 +30,17 @@ tcpreplay -i enp225s0np0  -K --pps 300000 --loop 1000000 --duration 10 ./mir.pca
 
 ```
  
+
+
+ Test via MGMT nic
+1
+ ```
+/mir-mips64 --src-ip 10.0.1.1 --dst-ip 10.0.0.2 --filter 946dae8b9b14 --filter-offset 6 &
+/dan-mips64 --src-ip 10.0.1.1 &
+ ```
+
+mgmt
+ ```
+/dan-amd64 --src-ip 10.0.1.1 &
+/mir-amd64 --src-ip 10.0.0.2 --dst-ip 10.0.1.1 --filter 20010000000000000000000100010002 --filter-offset 38 --metrics
+ ```
