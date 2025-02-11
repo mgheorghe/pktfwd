@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -62,6 +63,13 @@ func updateMetrics(f func(*Metrics)) {
 	metricsMutex.Unlock()
 }
 
+// HostToNetShort converts a 16-bit integer from host to network byte order, aka "htons"
+func HostToNetShort(i uint16) uint16 {
+	b := make([]byte, 2)
+	binary.LittleEndian.PutUint16(b, i)
+	return binary.BigEndian.Uint16(b)
+}
+
 func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int) (*RawReceiver, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -69,13 +77,17 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}
 
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, syscall.ETH_P_ALL)
+	//fd, err := syscall.Socket(syscall.AF, syscall.SOCK_RAW, syscall.ETH_P_ALL)
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
 
 	sll := syscall.SockaddrLinklayer{
 		Ifindex:  iface.Index,
-		Protocol: syscall.ETH_P_ALL,
+		Protocol: HostToNetShort(syscall.ETH_P_ALL),
+		Hatype:   syscall.ARPHRD_NETROM,
+		Pkttype:  syscall.PACKET_HOST,
+		Halen:    0,
 	}
 	if err := syscall.Bind(fd, &sll); err != nil {
 		syscall.Close(fd)
