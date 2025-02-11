@@ -92,12 +92,12 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}
 
 	sll := syscall.SockaddrLinklayer{
-		Ifindex: iface.Index,
-		//Protocol: HostToNetShort(syscall.ETH_P_ALL),
-		Protocol: syscall.ETH_P_ALL,
-		Pkttype:  syscall.PACKET_HOST,
-		//Hatype:   syscall.ARPHRD_NETROM,
-		//Halen:    0,
+		Ifindex:  iface.Index,
+		Protocol: HostToNetShort(syscall.ETH_P_ALL),
+		//Protocol: syscall.ETH_P_ALL,
+		Pkttype: syscall.PACKET_HOST,
+		Hatype:  syscall.ARPHRD_NETROM,
+		Halen:   0,
 	}
 	if err := syscall.Bind(fd, &sll); err != nil {
 		syscall.Close(fd)
