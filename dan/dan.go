@@ -18,8 +18,8 @@ import (
 
 const (
 	ETH_P_ALL    = 0x0003
-	BUFFER_SIZE  = 4096 // Start with a moderate buffer size
-	CHANNEL_SIZE = 1000
+	BUFFER_SIZE  = 8192
+	CHANNEL_SIZE = 10000
 )
 
 type Metrics struct {
@@ -72,6 +72,17 @@ func NewUDPReceiver(addr string, packets chan<- Packet) (*UDPReceiver, error) {
 		return nil, err
 	}
 
+	fd, err := conn.File()
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	err = syscall.SetsockoptInt(int(fd.Fd()), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1024*1024)
+	if err != nil {
+		return nil, err
+	}
+
 	return &UDPReceiver{
 		conn:    conn,
 		packets: packets,
@@ -95,9 +106,11 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 					bufferPool.Put(buf)
 					continue
 				}
+
 				updateMetrics(func(m *Metrics) {
 					m.RxFrames++
 				})
+
 				select {
 				case r.packets <- Packet{Data: buf[:n]}:
 				default:

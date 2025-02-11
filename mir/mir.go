@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -77,7 +78,6 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}
 
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, syscall.ETH_P_ALL)
-	//fd, err := syscall.Socket(syscall.AF, syscall.SOCK_RAW, syscall.ETH_P_ALL)
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
@@ -168,17 +168,8 @@ func (r *RawReceiver) Start(ctx context.Context) {
 						continue
 					}
 
-					matched := true
-					for i := 0; i < len(r.filter); i++ {
-						if buf[r.filterOffset+i] != r.filter[i] {
-							//fmt.Printf("B: %x -> F: %x\n", buf[r.filterOffset+i], r.filter[i])
-							matched = false
-							break
-						}
-					}
-
-					if !matched {
-						bufferPool.Put(buf) // Return buffer to pool if filtered
+					if !bytes.Equal(buf[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
+						bufferPool.Put(buf)
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
