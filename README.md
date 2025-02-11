@@ -96,3 +96,12 @@ $Env:GOOS = "linux"; $Env:GOARCH = "mips64"; go build -o mir-mips64 ./
 
 
 ```
+
+
+
+```
+[/root/dan-amd64 --dst-iface mgmt0 --src-ip 10.0.0.2 --metrics]
+[/root/mir-amd64 --src-iface eth0 --src-ip 10.0.0.2 --dst-ip 10.0.1.1 --filter 2620017b0003c000000000000004bd33 --filter-offset 38 --metrics --bmcast]
+[/dan-mips64 --src-ip 10.0.1.1 --metrics]
+[/mir-mips64 --src-ip 10.0.1.1 --dst-ip 10.0.0.2 --filter 946dae8b9b14 --filter-offset 6 --metrics]
+```
