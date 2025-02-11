@@ -46,6 +46,9 @@ type UDPSender struct {
 type Metrics struct {
 	RxFrames  uint64
 	RxFilter  uint64
+	IPv6      uint64
+	Multicast uint64
+	Broadcast uint64
 	TxFrames  uint64
 	RxErrors  uint64 // Receive errors
 	TxErrors  uint64 // Transmit errors
@@ -156,8 +159,36 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					m.RxFrames++
 				})
 
-				//fmt.Printf("Buffer: %x\n", buf[:n])
-				//fmt.Printf("Filter: %x\n", r.filter)
+				// Check for broadcast packets
+				if bytes.Equal(buf[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+					updateMetrics(func(m *Metrics) {
+						m.Broadcast++
+					})
+					// For broadcast packets, skip filter and copy directly
+					data := make([]byte, n)
+					copy(data, buf[:n])
+					bufferPool.Put(buf)
+					r.packets <- Packet{Data: data}
+					continue
+				}
+
+				// Check for IPv6 packets
+				if n > 14 && buf[12] == 0x86 && buf[13] == 0xDD {
+					updateMetrics(func(m *Metrics) {
+						m.IPv6++
+					})
+					if buf[38] == 0xff {
+						updateMetrics(func(m *Metrics) {
+							m.Multicast++
+						})
+						// For broadcast packets, skip filter and copy directly
+						data := make([]byte, n)
+						copy(data, buf[:n])
+						bufferPool.Put(buf)
+						r.packets <- Packet{Data: data}
+						continue
+					}
+				}
 
 				// Apply filter if specified
 				if r.filter != nil {
@@ -242,13 +273,16 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 				metricsMutex.Lock()
 				fmt.Print("\033[H\033[2J")
 				fmt.Printf("%s\n"+
-					"Rx Frames: %d\n"+
-					"Rx Filter: %d\n"+
-					"Tx Frames: %d\n"+
-					"Rx Errors: %d\n"+
-					"Tx Errors: %d\n"+
-					"Rx Rate: %d\n"+
-					"Tx Rate: %d\n",
+					"Rx Frames : %d\n"+
+					"Rx Filter : %d\n"+
+					"Tx Frames : %d\n"+
+					"Rx Errors : %d\n"+
+					"Tx Errors : %d\n"+
+					"Rx Rate   : %d\n"+
+					"Tx Rate   : %d\n"+
+					"IPv6      : %d\n"+
+					"Multicast : %d\n"+
+					"Broadcast : %d\n",
 					os.Args,
 					metrics.RxFrames,
 					metrics.RxFilter,
@@ -256,7 +290,10 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					metrics.RxErrors,
 					metrics.TxErrors,
 					metrics.RxRate,
-					metrics.TxRate)
+					metrics.TxRate,
+					metrics.IPv6,
+					metrics.Multicast,
+					metrics.Broadcast)
 				metricsMutex.Unlock()
 			}
 		}
