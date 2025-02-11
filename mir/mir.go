@@ -36,6 +36,7 @@ type RawReceiver struct {
 	packets      chan<- Packet
 	filter       []byte
 	filterOffset int
+	bmcast       bool
 }
 
 type UDPSender struct {
@@ -79,7 +80,7 @@ func HostToNetShort(i uint16) uint16 {
 	return binary.BigEndian.Uint16(buf[:])
 }
 
-func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int) (*RawReceiver, error) {
+func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int, bmcast bool) (*RawReceiver, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("error getting interface: %v", err)
@@ -108,6 +109,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		ifIndex:      iface.Index,
 		packets:      packets,
 		filter:       filter,
+		bmcast:       bmcast,
 		filterOffset: filterOffset,
 	}, nil
 }
@@ -165,7 +167,8 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				})
 
 				// Check for broadcast packets
-				if bytes.Equal(buf[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+
+				if r.bmcast && bytes.Equal(buf[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
 					updateMetrics(func(m *Metrics) {
 						m.Broadcast++
 					})
@@ -178,7 +181,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				}
 
 				// Check for IPv6 packets
-				if n > 14 && buf[12] == 0x86 && buf[13] == 0xDD {
+				if r.bmcast && n > 14 && buf[12] == 0x86 && buf[13] == 0xDD {
 					updateMetrics(func(m *Metrics) {
 						m.IPv6++
 					})
@@ -322,6 +325,7 @@ func main() {
 	filter_str := flag.String("filter", "", "Source UDP address")
 	filter_offset := flag.Int("filter-offset", 0, "Source UDP address")
 	metrics_enabled := flag.Bool("metrics", false, "Enable metrics collection and reporting")
+	bmcast := flag.Bool("bmcast", false, "allow broadcast and multicast packets")
 	flag.Parse()
 
 	hexStr := *filter_str
@@ -336,7 +340,7 @@ func main() {
 
 	packets := make(chan Packet, CHANNEL_SIZE)
 
-	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset)
+	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset, *bmcast)
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
