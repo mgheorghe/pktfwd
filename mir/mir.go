@@ -70,9 +70,13 @@ func updateMetrics(f func(*Metrics)) {
 
 // HostToNetShort converts a 16-bit integer from host to network byte order, aka "htons"
 func HostToNetShort(i uint16) uint16 {
-	b := make([]byte, 2)
-	binary.LittleEndian.PutUint16(b, i)
-	return binary.BigEndian.Uint16(b)
+	var buf [2]byte
+	if runtime.GOARCH == "mips" || runtime.GOARCH == "mips64" {
+		binary.BigEndian.PutUint16(buf[:], i)
+	} else {
+		binary.LittleEndian.PutUint16(buf[:], i)
+	}
+	return binary.BigEndian.Uint16(buf[:])
 }
 
 func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int) (*RawReceiver, error) {
@@ -87,11 +91,12 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}
 
 	sll := syscall.SockaddrLinklayer{
-		Ifindex:  iface.Index,
-		Protocol: HostToNetShort(syscall.ETH_P_ALL),
-		Hatype:   syscall.ARPHRD_NETROM,
+		Ifindex: iface.Index,
+		//Protocol: HostToNetShort(syscall.ETH_P_ALL),
+		Protocol: syscall.ETH_P_ALL,
 		Pkttype:  syscall.PACKET_HOST,
-		Halen:    0,
+		//Hatype:   syscall.ARPHRD_NETROM,
+		//Halen:    0,
 	}
 	if err := syscall.Bind(fd, &sll); err != nil {
 		syscall.Close(fd)
