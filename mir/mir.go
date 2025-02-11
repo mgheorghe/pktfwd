@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -315,4 +316,16 @@ func main() {
 
 	<-sigs
 	fmt.Println("Received SIGINT. Exiting...")
+
+	// Print memory statistics
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	fmt.Printf("Alloc = %v MiB", bToMb(memStats.Alloc))
+	fmt.Printf("\tTotalAlloc = %v MiB", bToMb(memStats.TotalAlloc))
+	fmt.Printf("\tSys = %v MiB", bToMb(memStats.Sys))
+	fmt.Printf("\tNumGC = %v\n", memStats.NumGC)
+}
+
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
 }
