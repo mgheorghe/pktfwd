@@ -214,6 +214,7 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					copy(packetData, frame[macOffset:macOffset+uint32(header.Len)])
 
 					// Add this right after line 207 where packetData is populated
+					fmt.Printf("Packet Len", packetLen)
 					fmt.Printf("Packet Data Hex: %s\n", hex.Dump(packetData))
 
 					// Process packet
