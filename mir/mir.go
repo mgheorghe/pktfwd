@@ -204,14 +204,12 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					packetData := frame[TPACKET_HDR_SIZE : TPACKET_HDR_SIZE+packetLen]
 
 					// Process packet
-					//log.Printf("Received packet of length %d", packetLen)
 					updateMetrics(func(m *Metrics) {
 						m.RxFrames++
 					})
 
 					// Check for broadcast packets
 					if r.bmcast && bytes.Equal(packetData[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
-						//log.Printf("Broadcast packet detected")
 						updateMetrics(func(m *Metrics) {
 							m.Broadcast++
 						})
@@ -219,17 +217,16 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 						data := make([]byte, packetLen)
 						copy(data, packetData)
 						r.packets <- Packet{Data: data}
+						header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
 						continue
 					}
 
 					// Check for IPv6 packets
 					if r.bmcast && packetLen > 14 && packetData[12] == 0x86 && packetData[13] == 0xDD {
-						//log.Printf("IPv6 packet detected")
 						updateMetrics(func(m *Metrics) {
 							m.IPv6++
 						})
 						if packetData[38] == 0xff {
-							//log.Printf("Multicast packet detected")
 							updateMetrics(func(m *Metrics) {
 								m.Multicast++
 							})
@@ -237,6 +234,7 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 							data := make([]byte, packetLen)
 							copy(data, packetData)
 							r.packets <- Packet{Data: data}
+							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
 							continue
 						}
 					}
@@ -244,18 +242,18 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					// Apply filter if specified
 					if r.filter != nil {
 						if r.filterOffset+len(r.filter) > packetLen {
-							//log.Printf("Packet does not match filter (too short)")
 							updateMetrics(func(m *Metrics) {
 								m.RxFilter++
 							})
+							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
 							continue
 						}
 
 						if !bytes.Equal(packetData[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
-							//log.Printf("Packet does not match filter")
 							updateMetrics(func(m *Metrics) {
 								m.RxFilter++
 							})
+							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
 							continue
 						}
 					}
