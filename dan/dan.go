@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -91,13 +93,39 @@ func NewUDPReceiver(addr string, packets chan<- Packet) (*UDPReceiver, error) {
 
 func (r *UDPReceiver) Start(ctx context.Context) {
 	go func() {
+		connFile, err := r.conn.File()
+		if err != nil {
+			log.Printf("error getting interface: %v", err)
+			return
+		}
+		defer connFile.Close()
+
+		pollFds := []unix.PollFd{
+			{
+				Fd:     int32(connFile.Fd()),
+				Events: unix.POLLIN,
+			},
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
+				// Wait for packets with poll
+				n, err := unix.Poll(pollFds, -1)
+				if err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.RxErrors++
+					})
+					continue
+				}
+				if n == 0 {
+					continue
+				}
+
 				buf := bufferPool.Get().([]byte)
-				n, _, err := r.conn.ReadFromUDP(buf)
+				n, _, err = r.conn.ReadFromUDP(buf)
 				if err != nil {
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
@@ -114,7 +142,6 @@ func (r *UDPReceiver) Start(ctx context.Context) {
 				select {
 				case r.packets <- Packet{Data: buf[:n]}:
 				default:
-					// Drop packet if channel is full
 					updateMetrics(func(m *Metrics) {
 						m.BufFullDrop++
 					})

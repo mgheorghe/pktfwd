@@ -21,17 +21,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ETH_P_ALL captures all protocols
 const (
 	ETH_P_ALL    = 0x0003
 	BUFFER_SIZE  = 2048
 	CHANNEL_SIZE = 1000
 )
 
+// Packet represents a network packet with data and error
 type Packet struct {
 	Data []byte
 	Err  error
 }
 
+// RawReceiver handles raw packet reception
 type RawReceiver struct {
 	fd           int
 	ifIndex      int
@@ -42,11 +45,13 @@ type RawReceiver struct {
 	packetBuffer []byte
 }
 
+// UDPSender handles UDP packet transmission
 type UDPSender struct {
 	conn    *net.UDPConn
 	packets <-chan Packet
 }
 
+// Metrics tracks packet statistics
 type Metrics struct {
 	RxFrames  uint64
 	RxFilter  uint64
@@ -54,8 +59,8 @@ type Metrics struct {
 	Multicast uint64
 	Broadcast uint64
 	TxFrames  uint64
-	RxErrors  uint64 // Receive errors
-	TxErrors  uint64 // Transmit errors
+	RxErrors  uint64
+	TxErrors  uint64
 	RxRate    uint64
 	TxRate    uint64
 	lastRx    uint64
@@ -72,7 +77,7 @@ func updateMetrics(f func(*Metrics)) {
 	metricsMutex.Unlock()
 }
 
-// HostToNetShort converts a 16-bit integer from host to network byte order, aka "htons"
+// HostToNetShort converts host to network byte order
 func HostToNetShort(i uint16) uint16 {
 	var buf [2]byte
 	if runtime.GOARCH == "mips" || runtime.GOARCH == "mips64" {
@@ -83,6 +88,25 @@ func HostToNetShort(i uint16) uint16 {
 	return binary.BigEndian.Uint16(buf[:])
 }
 
+// bToMb converts bytes to megabytes
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
+
+// Add this helper function
+func (r *RawReceiver) forwardPacket(packetData []byte, header *unix.TpacketHdr) {
+	data := bufferPool.Get().([]byte)
+	if cap(data) < len(packetData) {
+		data = make([]byte, len(packetData))
+	} else {
+		data = data[:len(packetData)]
+	}
+	copy(data, packetData)
+	r.packets <- Packet{Data: data}
+	header.Status = unix.TP_STATUS_KERNEL
+}
+
+// NewRawReceiver creates raw socket receiver
 func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int, bmcast bool) (*RawReceiver, error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -133,6 +157,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}, nil
 }
 
+// NewUDPSender creates UDP packet sender
 func NewUDPSender(srcAddr, dstAddr string, packets <-chan Packet) (*UDPSender, error) {
 	srcUDPAddr, err := net.ResolveUDPAddr("udp", srcAddr)
 	if err != nil {
@@ -161,6 +186,7 @@ var bufferPool = sync.Pool{
 	},
 }
 
+// Start begins packet reception
 func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 	go func() {
 		log.Println("RawReceiver started")
@@ -179,7 +205,6 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 				}
 				n, err := unix.Poll(pollFds, -1)
 				if err != nil {
-					log.Printf("Poll error: %v", err)
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
@@ -187,7 +212,6 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					continue
 				}
 				if n == 0 {
-					log.Println("Poll returned 0, no events")
 					continue
 				}
 
@@ -199,13 +223,6 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 						continue
 					}
 
-					//packetLen := int(header.Len)
-					const (
-						TPACKET_HDR_SIZE = 16 // TpacketHdr structure size
-					)
-
-					//packetLen = int(header.Len)
-					// Add this before using packetDataBuffer
 					packetDataBuffer := make([]byte, BUFFER_SIZE)
 
 					// Get the actual packet data starting from MAC header
@@ -214,9 +231,8 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					packetData := packetDataBuffer[:packetLen]
 					copy(packetData, frame[macOffset:macOffset+packetLen])
 
-					// Add this right after line 207 where packetData is populated
-					fmt.Printf("Packet Len: %d\n", packetLen)
-					fmt.Printf("Packet Data Hex: \n%s\n", hex.Dump(packetData))
+					//fmt.Printf("Packet Len: %d\n", packetLen)
+					//fmt.Printf("Packet Data Hex: \n%s\n", hex.Dump(packetData))
 
 					// Process packet
 					updateMetrics(func(m *Metrics) {
@@ -229,16 +245,7 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 							m.Broadcast++
 						})
 						// For broadcast packets, skip filter and copy directly
-						// Get a buffer from the pool
-						data := bufferPool.Get().([]byte)
-						if cap(data) < len(packetData) {
-							data = make([]byte, len(packetData))
-						} else {
-							data = data[:len(packetData)]
-						}
-						copy(data, packetData)
-						r.packets <- Packet{Data: data}
-						header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
+						r.forwardPacket(packetData, header)
 						continue
 					}
 
@@ -252,16 +259,7 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 								m.Multicast++
 							})
 							// For multicast packets, skip filter and copy directly
-							// Get a buffer from the pool
-							data := bufferPool.Get().([]byte)
-							if cap(data) < len(packetData) {
-								data = make([]byte, len(packetData))
-							} else {
-								data = data[:len(packetData)]
-							}
-							copy(data, packetData)
-							r.packets <- Packet{Data: data}
-							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
+							r.forwardPacket(packetData, header)
 							continue
 						}
 					}
@@ -286,24 +284,14 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					}
 
 					// Only copy data if packet passes filter
-					// Get a buffer from the pool
-					data := bufferPool.Get().([]byte)
-					if cap(data) < len(packetData) {
-						data = make([]byte, len(packetData))
-					} else {
-						data = data[:len(packetData)]
-					}
-					copy(data, packetData)
-
-					r.packets <- Packet{Data: data}
-					// Mark frame as available
-					header.Status = unix.TP_STATUS_KERNEL
+					r.forwardPacket(packetData, header)
 				}
 			}
 		}
 	}()
 }
 
+// Start begins packet transmission
 func (s *UDPSender) Start(ctx context.Context) {
 	go func() {
 		for {
@@ -333,6 +321,8 @@ func (s *UDPSender) Start(ctx context.Context) {
 		}
 	}()
 }
+
+// startMetricsReporter prints metrics at intervals
 func startMetricsReporter(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -385,6 +375,7 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+// main initializes and runs the packet forwarder
 func main() {
 	fmt.Println("Starting packet forwarder...")
 
@@ -415,7 +406,6 @@ func main() {
 	dst_addr := fmt.Sprintf("%s:%d", *dst_ip, *dst_port)
 	src_addr := fmt.Sprintf("%s:%d", *src_ip, *src_port)
 
-	const CHANNEL_SIZE = 1000
 	packets := make(chan Packet, CHANNEL_SIZE)
 
 	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset, *bmcast)
@@ -453,8 +443,4 @@ func main() {
 	fmt.Printf("\tTotalAlloc = %v MiB", bToMb(memStats.TotalAlloc))
 	fmt.Printf("\tSys = %v MiB", bToMb(memStats.Sys))
 	fmt.Printf("\tNumGC = %v\n", memStats.NumGC)
-}
-
-func bToMb(b uint64) uint64 {
-	return b / 1024 / 1024
 }
