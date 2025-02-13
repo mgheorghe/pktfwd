@@ -15,8 +15,9 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -37,6 +38,7 @@ type RawReceiver struct {
 	filter       []byte
 	filterOffset int
 	bmcast       bool
+	packetBuffer []byte
 }
 
 type UDPSender struct {
@@ -86,22 +88,39 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		return nil, fmt.Errorf("error getting interface: %v", err)
 	}
 
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, syscall.ETH_P_ALL)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_ALL)))
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
 
-	sll := syscall.SockaddrLinklayer{
+	sll := unix.SockaddrLinklayer{
 		Ifindex:  iface.Index,
-		Protocol: HostToNetShort(syscall.ETH_P_ALL),
-		//Protocol: syscall.ETH_P_ALL,
-		Pkttype: syscall.PACKET_HOST,
-		Hatype:  syscall.ARPHRD_NETROM,
-		Halen:   0,
+		Protocol: HostToNetShort(ETH_P_ALL),
+		Pkttype:  unix.PACKET_HOST,
+		Hatype:   unix.ARPHRD_NETROM,
+		Halen:    0,
 	}
-	if err := syscall.Bind(fd, &sll); err != nil {
-		syscall.Close(fd)
+	if err := unix.Bind(fd, &sll); err != nil {
+		unix.Close(fd)
 		return nil, fmt.Errorf("error binding socket: %v", err)
+	}
+
+	// Set up packet ring buffer
+	req := &unix.TpacketReq{}
+	req.Block_size = 1 << 22 // 4 MiB
+	req.Block_nr = 64
+	req.Frame_size = 1 << 11 // 2 KiB
+	req.Frame_nr = (1 << 22) * 64 / (1 << 11)
+	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_RX_RING, req); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("error setting up packet ring: %v", err)
+	}
+
+	// Set up mmap for zero-copy
+	packetBuffer, err := unix.Mmap(fd, 0, int(req.Block_size*req.Block_nr), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("error setting up mmap: %v", err)
 	}
 
 	return &RawReceiver{
@@ -111,6 +130,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		filter:       filter,
 		bmcast:       bmcast,
 		filterOffset: filterOffset,
+		packetBuffer: packetBuffer,
 	}, nil
 }
 
@@ -149,12 +169,9 @@ func (r *RawReceiver) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				// Get buffer from pool
-				buf := bufferPool.Get().([]byte)
-
-				n, _, err := syscall.Recvfrom(r.fd, buf, 0)
+				// Use mmap buffer directly
+				n, _, err := unix.Recvfrom(r.fd, r.packetBuffer, 0)
 				if err != nil {
-					bufferPool.Put(buf) // Return buffer to pool on error
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
@@ -167,32 +184,29 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				})
 
 				// Check for broadcast packets
-
-				if r.bmcast && bytes.Equal(buf[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+				if r.bmcast && bytes.Equal(r.packetBuffer[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
 					updateMetrics(func(m *Metrics) {
 						m.Broadcast++
 					})
 					// For broadcast packets, skip filter and copy directly
 					data := make([]byte, n)
-					copy(data, buf[:n])
-					bufferPool.Put(buf)
+					copy(data, r.packetBuffer[:n])
 					r.packets <- Packet{Data: data}
 					continue
 				}
 
 				// Check for IPv6 packets
-				if r.bmcast && n > 14 && buf[12] == 0x86 && buf[13] == 0xDD {
+				if r.bmcast && n > 14 && r.packetBuffer[12] == 0x86 && r.packetBuffer[13] == 0xDD {
 					updateMetrics(func(m *Metrics) {
 						m.IPv6++
 					})
-					if buf[38] == 0xff {
+					if r.packetBuffer[38] == 0xff {
 						updateMetrics(func(m *Metrics) {
 							m.Multicast++
 						})
 						// For broadcast packets, skip filter and copy directly
 						data := make([]byte, n)
-						copy(data, buf[:n])
-						bufferPool.Put(buf)
+						copy(data, r.packetBuffer[:n])
 						r.packets <- Packet{Data: data}
 						continue
 					}
@@ -201,15 +215,13 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				// Apply filter if specified
 				if r.filter != nil {
 					if r.filterOffset+len(r.filter) > n {
-						bufferPool.Put(buf) // Return buffer to pool if filtered
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
 						continue
 					}
 
-					if !bytes.Equal(buf[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
-						bufferPool.Put(buf)
+					if !bytes.Equal(r.packetBuffer[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
@@ -219,14 +231,14 @@ func (r *RawReceiver) Start(ctx context.Context) {
 
 				// Only copy data if packet passes filter
 				data := make([]byte, n)
-				copy(data, buf[:n])
-				bufferPool.Put(buf) // Return buffer to pool after copying
+				copy(data, r.packetBuffer[:n])
 
 				r.packets <- Packet{Data: data}
 			}
 		}
 	}()
 }
+
 func (s *UDPSender) Start(ctx context.Context) {
 	go func() {
 		for {
@@ -264,7 +276,6 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-
 				// Calculate rates
 				now := time.Now()
 				duration := now.Sub(metrics.timestamp).Seconds()
@@ -315,7 +326,7 @@ func main() {
 	defer cancel()
 
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT)
+	signal.Notify(sigs, unix.SIGINT)
 
 	src_iface := flag.String("src-iface", "eth0", "Source interface to copy packets from")
 	dst_ip := flag.String("dst-ip", "10.0.1.7", "Destination UDP address")
@@ -344,7 +355,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
 	}
-	defer syscall.Close(receiver.fd)
+	defer unix.Close(receiver.fd)
 
 	sender, err := NewUDPSender(src_addr, dst_addr, packets)
 	if err != nil {
