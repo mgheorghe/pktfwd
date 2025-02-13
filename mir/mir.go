@@ -199,22 +199,23 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 						continue
 					}
 
-					packetLen := int(header.Len)
+					//packetLen := int(header.Len)
 					const (
 						TPACKET_HDR_SIZE = 16 // TpacketHdr structure size
 					)
 
-					packetLen = int(header.Len)
+					//packetLen = int(header.Len)
 					// Add this before using packetDataBuffer
 					packetDataBuffer := make([]byte, BUFFER_SIZE)
 
 					// Get the actual packet data starting from MAC header
-					packetData := packetDataBuffer[:header.Len]
 					macOffset := uint32(header.Mac)
-					copy(packetData, frame[macOffset:macOffset+uint32(header.Len)])
+					packetLen := uint32(header.Len)
+					packetData := packetDataBuffer[:packetLen]
+					copy(packetData, frame[macOffset:macOffset+packetLen])
 
 					// Add this right after line 207 where packetData is populated
-					fmt.Printf("Packet Len", packetLen)
+					fmt.Printf("Packet Len: %d", packetLen)
 					fmt.Printf("Packet Data Hex: %s\n", hex.Dump(packetData))
 
 					// Process packet
@@ -267,7 +268,7 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 
 					// Apply filter if specified
 					if r.filter != nil {
-						if r.filterOffset+len(r.filter) > packetLen {
+						if r.filterOffset+len(r.filter) > int(packetLen) {
 							updateMetrics(func(m *Metrics) {
 								m.RxFilter++
 							})
