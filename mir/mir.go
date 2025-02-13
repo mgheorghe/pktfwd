@@ -200,8 +200,20 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					}
 
 					packetLen := int(header.Len)
-					const TPACKET_HDR_SIZE = 16 // Define the size of TpacketHdr structure
-					packetData := frame[TPACKET_HDR_SIZE : TPACKET_HDR_SIZE+packetLen]
+					const (
+						TPACKET_HDR_SIZE = 16 // TpacketHdr structure size
+					)
+
+					packetLen = int(header.Len)
+					// Include MAC headers in the packet data
+					// Pre-allocate at RawReceiver initialization
+					packetDataBuffer := make([]byte, BUFFER_SIZE)
+					// Use during packet processing
+					packetData := packetDataBuffer[:TPACKET_HDR_SIZE+int(header.Len)]
+					copy(packetData[TPACKET_HDR_SIZE:], frame[TPACKET_HDR_SIZE:TPACKET_HDR_SIZE+int(header.Len)])
+
+					// Add this right after line 207 where packetData is populated
+					fmt.Printf("Packet Data Hex: %s\n", hex.Dump(packetData))
 
 					// Process packet
 					updateMetrics(func(m *Metrics) {
@@ -214,7 +226,13 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 							m.Broadcast++
 						})
 						// For broadcast packets, skip filter and copy directly
-						data := make([]byte, packetLen)
+						// Get a buffer from the pool
+						data := bufferPool.Get().([]byte)
+						if cap(data) < len(packetData) {
+							data = make([]byte, len(packetData))
+						} else {
+							data = data[:len(packetData)]
+						}
 						copy(data, packetData)
 						r.packets <- Packet{Data: data}
 						header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
@@ -231,7 +249,13 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 								m.Multicast++
 							})
 							// For multicast packets, skip filter and copy directly
-							data := make([]byte, packetLen)
+							// Get a buffer from the pool
+							data := bufferPool.Get().([]byte)
+							if cap(data) < len(packetData) {
+								data = make([]byte, len(packetData))
+							} else {
+								data = data[:len(packetData)]
+							}
 							copy(data, packetData)
 							r.packets <- Packet{Data: data}
 							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
@@ -259,11 +283,16 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					}
 
 					// Only copy data if packet passes filter
-					data := make([]byte, packetLen)
+					// Get a buffer from the pool
+					data := bufferPool.Get().([]byte)
+					if cap(data) < len(packetData) {
+						data = make([]byte, len(packetData))
+					} else {
+						data = data[:len(packetData)]
+					}
 					copy(data, packetData)
 
 					r.packets <- Packet{Data: data}
-
 					// Mark frame as available
 					header.Status = unix.TP_STATUS_KERNEL
 				}
@@ -286,6 +315,8 @@ func (s *UDPSender) Start(ctx context.Context) {
 					continue
 				}
 				_, err := s.conn.Write(packet.Data)
+				// Return the buffer to the pool after sending
+				bufferPool.Put(packet.Data)
 				if err != nil {
 					updateMetrics(func(m *Metrics) {
 						m.TxErrors++
@@ -299,7 +330,6 @@ func (s *UDPSender) Start(ctx context.Context) {
 		}
 	}()
 }
-
 func startMetricsReporter(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -382,6 +412,7 @@ func main() {
 	dst_addr := fmt.Sprintf("%s:%d", *dst_ip, *dst_port)
 	src_addr := fmt.Sprintf("%s:%d", *src_ip, *src_port)
 
+	const CHANNEL_SIZE = 1000
 	packets := make(chan Packet, CHANNEL_SIZE)
 
 	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset, *bmcast)
