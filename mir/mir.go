@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -96,9 +97,6 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	sll := unix.SockaddrLinklayer{
 		Ifindex:  iface.Index,
 		Protocol: HostToNetShort(ETH_P_ALL),
-		Pkttype:  unix.PACKET_HOST,
-		Hatype:   unix.ARPHRD_NETROM,
-		Halen:    0,
 	}
 	if err := unix.Bind(fd, &sll); err != nil {
 		unix.Close(fd)
@@ -106,11 +104,12 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	}
 
 	// Set up packet ring buffer
-	req := &unix.TpacketReq{}
-	req.Block_size = 1 << 22 // 4 MiB
-	req.Block_nr = 64
-	req.Frame_size = 1 << 11 // 2 KiB
-	req.Frame_nr = (1 << 22) * 64 / (1 << 11)
+	req := &unix.TpacketReq{
+		Block_size: 1 << 22, // 4 MiB
+		Block_nr:   64,
+		Frame_size: 1 << 11, // 2 KiB
+		Frame_nr:   (1 << 22) * 64 / (1 << 11),
+	}
 	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_RX_RING, req); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("error setting up packet ring: %v", err)
@@ -162,7 +161,7 @@ var bufferPool = sync.Pool{
 	},
 }
 
-func (r *RawReceiver) Start(ctx context.Context) {
+func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 	go func() {
 		log.Println("RawReceiver started")
 		for {
@@ -192,78 +191,84 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					continue
 				}
 
-				// Use mmap buffer directly
-				n, _, err = unix.Recvfrom(r.fd, r.packetBuffer, 0)
-				if err != nil {
-					log.Printf("Recvfrom error: %v", err)
-					updateMetrics(func(m *Metrics) {
-						m.RxErrors++
-					})
-					r.packets <- Packet{Err: err}
-					continue
-				}
+				// Read packet from mmap buffer
+				for i := 0; i < len(r.packetBuffer); i += int(req.Frame_size) {
+					frame := r.packetBuffer[i : i+int(req.Frame_size)]
+					header := (*unix.TpacketHdr)(unsafe.Pointer(&frame[0]))
+					if header.Status&unix.TP_STATUS_USER == 0 {
+						continue
+					}
 
-				log.Printf("Received packet of length %d", n)
-				updateMetrics(func(m *Metrics) {
-					m.RxFrames++
-				})
+					packetLen := int(header.Len)
+					const TPACKET_HDR_SIZE = 16 // Define the size of TpacketHdr structure
+					packetData := frame[TPACKET_HDR_SIZE : TPACKET_HDR_SIZE+packetLen]
 
-				// Check for broadcast packets
-				if r.bmcast && bytes.Equal(r.packetBuffer[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
-					log.Printf("Broadcast packet detected")
+					// Process packet
+					//log.Printf("Received packet of length %d", packetLen)
 					updateMetrics(func(m *Metrics) {
-						m.Broadcast++
+						m.RxFrames++
 					})
-					// For broadcast packets, skip filter and copy directly
-					data := make([]byte, n)
-					copy(data, r.packetBuffer[:n])
-					r.packets <- Packet{Data: data}
-					continue
-				}
 
-				// Check for IPv6 packets
-				if r.bmcast && n > 14 && r.packetBuffer[12] == 0x86 && r.packetBuffer[13] == 0xDD {
-					log.Printf("IPv6 packet detected")
-					updateMetrics(func(m *Metrics) {
-						m.IPv6++
-					})
-					if r.packetBuffer[38] == 0xff {
-						log.Printf("Multicast packet detected")
+					// Check for broadcast packets
+					if r.bmcast && bytes.Equal(packetData[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+						//log.Printf("Broadcast packet detected")
 						updateMetrics(func(m *Metrics) {
-							m.Multicast++
+							m.Broadcast++
 						})
-						// For multicast packets, skip filter and copy directly
-						data := make([]byte, n)
-						copy(data, r.packetBuffer[:n])
+						// For broadcast packets, skip filter and copy directly
+						data := make([]byte, packetLen)
+						copy(data, packetData)
 						r.packets <- Packet{Data: data}
 						continue
 					}
-				}
 
-				// Apply filter if specified
-				if r.filter != nil {
-					if r.filterOffset+len(r.filter) > n {
-						log.Printf("Packet does not match filter (too short)")
+					// Check for IPv6 packets
+					if r.bmcast && packetLen > 14 && packetData[12] == 0x86 && packetData[13] == 0xDD {
+						//log.Printf("IPv6 packet detected")
 						updateMetrics(func(m *Metrics) {
-							m.RxFilter++
+							m.IPv6++
 						})
-						continue
+						if packetData[38] == 0xff {
+							//log.Printf("Multicast packet detected")
+							updateMetrics(func(m *Metrics) {
+								m.Multicast++
+							})
+							// For multicast packets, skip filter and copy directly
+							data := make([]byte, packetLen)
+							copy(data, packetData)
+							r.packets <- Packet{Data: data}
+							continue
+						}
 					}
 
-					if !bytes.Equal(r.packetBuffer[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
-						log.Printf("Packet does not match filter")
-						updateMetrics(func(m *Metrics) {
-							m.RxFilter++
-						})
-						continue
+					// Apply filter if specified
+					if r.filter != nil {
+						if r.filterOffset+len(r.filter) > packetLen {
+							//log.Printf("Packet does not match filter (too short)")
+							updateMetrics(func(m *Metrics) {
+								m.RxFilter++
+							})
+							continue
+						}
+
+						if !bytes.Equal(packetData[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
+							//log.Printf("Packet does not match filter")
+							updateMetrics(func(m *Metrics) {
+								m.RxFilter++
+							})
+							continue
+						}
 					}
+
+					// Only copy data if packet passes filter
+					data := make([]byte, packetLen)
+					copy(data, packetData)
+
+					r.packets <- Packet{Data: data}
+
+					// Mark frame as available
+					header.Status = unix.TP_STATUS_KERNEL
 				}
-
-				// Only copy data if packet passes filter
-				data := make([]byte, n)
-				copy(data, r.packetBuffer[:n])
-
-				r.packets <- Packet{Data: data}
 			}
 		}
 	}()
@@ -393,7 +398,12 @@ func main() {
 	}
 	defer sender.conn.Close()
 
-	receiver.Start(ctx)
+	receiver.Start(ctx, &unix.TpacketReq{
+		Block_size: 1 << 22, // 4 MiB
+		Block_nr:   64,
+		Frame_size: 1 << 11, // 2 KiB
+		Frame_nr:   (1 << 22) * 64 / (1 << 11),
+	})
 	sender.Start(ctx)
 
 	// Start metrics reporter (prints every 1 seconds)
