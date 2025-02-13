@@ -164,9 +164,11 @@ var bufferPool = sync.Pool{
 
 func (r *RawReceiver) Start(ctx context.Context) {
 	go func() {
+		log.Println("RawReceiver started")
 		for {
 			select {
 			case <-ctx.Done():
+				log.Println("Context done, stopping RawReceiver")
 				return
 			default:
 				// Use poll to wait for incoming packets
@@ -176,18 +178,24 @@ func (r *RawReceiver) Start(ctx context.Context) {
 						Events: unix.POLLIN,
 					},
 				}
-				_, err := unix.Poll(pollFds, -1)
+				n, err := unix.Poll(pollFds, -1)
 				if err != nil {
+					log.Printf("Poll error: %v", err)
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
 					r.packets <- Packet{Err: err}
+					continue
+				}
+				if n == 0 {
+					log.Println("Poll returned 0, no events")
 					continue
 				}
 
 				// Use mmap buffer directly
-				n, _, err := unix.Recvfrom(r.fd, r.packetBuffer, 0)
+				n, _, err = unix.Recvfrom(r.fd, r.packetBuffer, 0)
 				if err != nil {
+					log.Printf("Recvfrom error: %v", err)
 					updateMetrics(func(m *Metrics) {
 						m.RxErrors++
 					})
@@ -195,12 +203,14 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					continue
 				}
 
+				log.Printf("Received packet of length %d", n)
 				updateMetrics(func(m *Metrics) {
 					m.RxFrames++
 				})
 
 				// Check for broadcast packets
 				if r.bmcast && bytes.Equal(r.packetBuffer[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+					log.Printf("Broadcast packet detected")
 					updateMetrics(func(m *Metrics) {
 						m.Broadcast++
 					})
@@ -213,14 +223,16 @@ func (r *RawReceiver) Start(ctx context.Context) {
 
 				// Check for IPv6 packets
 				if r.bmcast && n > 14 && r.packetBuffer[12] == 0x86 && r.packetBuffer[13] == 0xDD {
+					log.Printf("IPv6 packet detected")
 					updateMetrics(func(m *Metrics) {
 						m.IPv6++
 					})
 					if r.packetBuffer[38] == 0xff {
+						log.Printf("Multicast packet detected")
 						updateMetrics(func(m *Metrics) {
 							m.Multicast++
 						})
-						// For broadcast packets, skip filter and copy directly
+						// For multicast packets, skip filter and copy directly
 						data := make([]byte, n)
 						copy(data, r.packetBuffer[:n])
 						r.packets <- Packet{Data: data}
@@ -231,6 +243,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 				// Apply filter if specified
 				if r.filter != nil {
 					if r.filterOffset+len(r.filter) > n {
+						log.Printf("Packet does not match filter (too short)")
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
@@ -238,6 +251,7 @@ func (r *RawReceiver) Start(ctx context.Context) {
 					}
 
 					if !bytes.Equal(r.packetBuffer[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
+						log.Printf("Packet does not match filter")
 						updateMetrics(func(m *Metrics) {
 							m.RxFilter++
 						})
