@@ -205,12 +205,13 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					)
 
 					packetLen = int(header.Len)
-					// Include MAC headers in the packet data
-					// Pre-allocate at RawReceiver initialization
+					// Add this before using packetDataBuffer
 					packetDataBuffer := make([]byte, BUFFER_SIZE)
-					// Use during packet processing
-					packetData := packetDataBuffer[:TPACKET_HDR_SIZE+int(header.Len)]
-					copy(packetData[TPACKET_HDR_SIZE:], frame[TPACKET_HDR_SIZE:TPACKET_HDR_SIZE+int(header.Len)])
+
+					// Then modify the packet data copy to use correct types
+					packetData := packetDataBuffer[:header.Len]
+					macOffset := uint32(header.Mac)
+					copy(packetData, frame[macOffset:macOffset+header.Len])
 
 					// Add this right after line 207 where packetData is populated
 					fmt.Printf("Packet Data Hex: %s\n", hex.Dump(packetData))
