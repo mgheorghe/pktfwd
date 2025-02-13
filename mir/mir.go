@@ -169,6 +169,22 @@ func (r *RawReceiver) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
+				// Use poll to wait for incoming packets
+				pollFds := []unix.PollFd{
+					{
+						Fd:     int32(r.fd),
+						Events: unix.POLLIN,
+					},
+				}
+				_, err := unix.Poll(pollFds, -1)
+				if err != nil {
+					updateMetrics(func(m *Metrics) {
+						m.RxErrors++
+					})
+					r.packets <- Packet{Err: err}
+					continue
+				}
+
 				// Use mmap buffer directly
 				n, _, err := unix.Recvfrom(r.fd, r.packetBuffer, 0)
 				if err != nil {
