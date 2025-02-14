@@ -24,11 +24,14 @@ import (
 // ETH_P_ALL captures all protocols
 const (
 	BUFFER_SIZE  = 2048
+	MAX_BUFFER   = 16384
 	CHANNEL_SIZE = 1000
 	RING_SIZE    = (1 << 22) * 64 / (1 << 11) // 32K frames
 )
 
 var ETH_P_ALL uint16
+
+//var logger *log.Logger
 
 func init() {
 	if runtime.GOARCH == "mips" || runtime.GOARCH == "mips64" {
@@ -36,6 +39,11 @@ func init() {
 	} else {
 		ETH_P_ALL = 0x0003 //unix.ETH_P_ALL
 	}
+	// logFile, err := os.OpenFile("pktfwd.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// logger = log.New(logFile, "", log.LstdFlags)
 }
 
 // Packet represents a network packet with data and error
@@ -53,6 +61,7 @@ type RawReceiver struct {
 	filterOffset int
 	bmcast       bool
 	packetBuffer []byte
+	done         chan struct{}
 }
 
 // UDPSender handles UDP packet transmission
@@ -76,6 +85,7 @@ type Metrics struct {
 	lastRx    uint64
 	lastTx    uint64
 	buffer    int
+	BufFull   uint64
 	timestamp time.Time
 }
 
@@ -105,6 +115,12 @@ func bToMb(b uint64) uint64 {
 }
 
 func getGrowingBuffer(size int) []byte {
+	if size > MAX_BUFFER {
+		updateMetrics(func(m *Metrics) {
+			m.BufFull++
+		})
+		return nil
+	}
 	buf := bufferPool.Get().([]byte)
 	if cap(buf) < size {
 		updateMetrics(func(m *Metrics) {
@@ -119,12 +135,20 @@ func getGrowingBuffer(size int) []byte {
 	return buf[:size]
 }
 
-// Add this helper function
 func (r *RawReceiver) forwardPacket(packetData []byte, header *unix.TpacketHdr) {
 	data := getGrowingBuffer(len(packetData))
+	if data == nil {
+		header.Status = unix.TP_STATUS_KERNEL
+		return
+	}
 	copy(data, packetData)
-	r.packets <- Packet{Data: data}
-	header.Status = unix.TP_STATUS_KERNEL
+
+	select {
+	case <-r.done:
+		return
+	case r.packets <- Packet{Data: data}:
+		header.Status = unix.TP_STATUS_KERNEL
+	}
 }
 
 // NewRawReceiver creates raw socket receiver
@@ -162,7 +186,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	req := &unix.TpacketReq{
 		Block_size: 1 << 22, // 4 MiB
 		Block_nr:   64,
-		Frame_size: 1 << 11, // 2 KiB
+		Frame_size: 1 << 11, // 16 KiB
 		Frame_nr:   RING_SIZE,
 	}
 	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_RX_RING, req); err != nil {
@@ -233,7 +257,7 @@ var bufferPool = sync.Pool{
 
 // Start begins packet reception
 func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
-	defer close(r.packets)
+	r.done = make(chan struct{})
 	go func() {
 		log.Println("RawReceiver started")
 		for {
@@ -260,19 +284,26 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 				if n == 0 {
 					continue
 				}
-
+				//logger.Println("Poll returned")
 				// Read packet from mmap buffer
 				for i := 0; i < len(r.packetBuffer); i += int(req.Frame_size) {
 					frame := r.packetBuffer[i : i+int(req.Frame_size)]
 					header := (*unix.TpacketHdr)(unsafe.Pointer(&frame[0]))
 					if header.Status&unix.TP_STATUS_USER == 0 {
+						//logger.Println("TP_STATUS_USER: 0")
 						continue
+					} else {
+						//logger.Println("TP_STATUS_USER: x")
 					}
 
 					// Get the actual packet data starting from MAC header
 					macOffset := uint32(header.Mac)
 					packetLen := uint32(header.Len)
 					packetDataBuffer := getGrowingBuffer(int(packetLen))
+					if packetDataBuffer == nil {
+						header.Status = unix.TP_STATUS_KERNEL // Return frame to kernel
+						continue
+					}
 					packetData := packetDataBuffer[:packetLen]
 					copy(packetData, frame[macOffset:macOffset+packetLen])
 
@@ -403,7 +434,8 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					"IPv6      : %d\n"+
 					"Multicast : %d\n"+
 					"Broadcast : %d\n"+
-					"Buffer    : %d\n",
+					"Buffer    : %d\n"+
+					"BufFull   : %d\n",
 					os.Args,
 					metrics.RxFrames,
 					metrics.RxFilter,
@@ -415,7 +447,8 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					metrics.IPv6,
 					metrics.Multicast,
 					metrics.Broadcast,
-					metrics.buffer)
+					metrics.buffer,
+					metrics.BufFull)
 				metricsMutex.Unlock()
 			}
 		}
@@ -497,7 +530,7 @@ func main() {
 	receiver.Start(ctx, &unix.TpacketReq{
 		Block_size: 1 << 22, // 4 MiB
 		Block_nr:   64,
-		Frame_size: 1 << 11, // 2 KiB
+		Frame_size: 1 << 11, // 16 KiB
 		Frame_nr:   RING_SIZE,
 	})
 	sender.Start(ctx)
