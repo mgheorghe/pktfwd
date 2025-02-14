@@ -255,6 +255,52 @@ var bufferPool = sync.Pool{
 	},
 }
 
+func (r *RawReceiver) filterPacket(packetData []byte, packetLen uint32, header *unix.TpacketHdr) bool {
+	// Check for broadcast packets
+	if r.bmcast && bytes.Equal(packetData[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
+		updateMetrics(func(m *Metrics) {
+			m.Broadcast++
+		})
+		r.forwardPacket(packetData, header)
+		return true
+	}
+
+	// Check for IPv6 packets
+	if r.bmcast && packetLen > 14 && packetData[12] == 0x86 && packetData[13] == 0xDD {
+		updateMetrics(func(m *Metrics) {
+			m.IPv6++
+		})
+		if packetData[38] == 0xff {
+			updateMetrics(func(m *Metrics) {
+				m.Multicast++
+			})
+			r.forwardPacket(packetData, header)
+			return true
+		}
+	}
+
+	// Apply filter if specified
+	if r.filter != nil {
+		if r.filterOffset+len(r.filter) > int(packetLen) {
+			updateMetrics(func(m *Metrics) {
+				m.RxFilter++
+			})
+			header.Status = unix.TP_STATUS_KERNEL
+			return true
+		}
+
+		if !bytes.Equal(packetData[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
+			updateMetrics(func(m *Metrics) {
+				m.RxFilter++
+			})
+			header.Status = unix.TP_STATUS_KERNEL
+			return true
+		}
+	}
+
+	return false
+}
+
 // Start begins packet reception
 func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 	r.done = make(chan struct{})
@@ -290,15 +336,21 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					frame := r.packetBuffer[i : i+int(req.Frame_size)]
 					header := (*unix.TpacketHdr)(unsafe.Pointer(&frame[0]))
 					if header.Status&unix.TP_STATUS_USER == 0 {
-						//logger.Println("TP_STATUS_USER: 0")
 						continue
-					} else {
-						//logger.Println("TP_STATUS_USER: x")
 					}
+
+					updateMetrics(func(m *Metrics) {
+						m.RxFrames++
+					})
 
 					// Get the actual packet data starting from MAC header
 					macOffset := uint32(header.Mac)
 					packetLen := uint32(header.Len)
+
+					// if r.filterPacket(frame[macOffset:macOffset+packetLen], packetLen, header) {
+					// 	continue
+					// }
+
 					packetDataBuffer := getGrowingBuffer(int(packetLen))
 					if packetDataBuffer == nil {
 						header.Status = unix.TP_STATUS_KERNEL // Return frame to kernel
@@ -310,53 +362,8 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 					//fmt.Printf("Packet Len: %d\n", packetLen)
 					//fmt.Printf("Packet Data Hex: \n%s\n", hex.Dump(packetData))
 
-					// Process packet
-					updateMetrics(func(m *Metrics) {
-						m.RxFrames++
-					})
-
-					// Check for broadcast packets
-					if r.bmcast && bytes.Equal(packetData[:6], []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) {
-						updateMetrics(func(m *Metrics) {
-							m.Broadcast++
-						})
-						// For broadcast packets, skip filter and copy directly
-						r.forwardPacket(packetData, header)
+					if r.filterPacket(packetData, packetLen, header) {
 						continue
-					}
-
-					// Check for IPv6 packets
-					if r.bmcast && packetLen > 14 && packetData[12] == 0x86 && packetData[13] == 0xDD {
-						updateMetrics(func(m *Metrics) {
-							m.IPv6++
-						})
-						if packetData[38] == 0xff {
-							updateMetrics(func(m *Metrics) {
-								m.Multicast++
-							})
-							// For multicast packets, skip filter and copy directly
-							r.forwardPacket(packetData, header)
-							continue
-						}
-					}
-
-					// Apply filter if specified
-					if r.filter != nil {
-						if r.filterOffset+len(r.filter) > int(packetLen) {
-							updateMetrics(func(m *Metrics) {
-								m.RxFilter++
-							})
-							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
-							continue
-						}
-
-						if !bytes.Equal(packetData[r.filterOffset:r.filterOffset+len(r.filter)], r.filter) {
-							updateMetrics(func(m *Metrics) {
-								m.RxFilter++
-							})
-							header.Status = unix.TP_STATUS_KERNEL // Mark frame as available
-							continue
-						}
 					}
 
 					// Only copy data if packet passes filter
