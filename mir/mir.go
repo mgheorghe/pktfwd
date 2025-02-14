@@ -26,6 +26,7 @@ const (
 	ETH_P_ALL    = 0x0003
 	BUFFER_SIZE  = 2048
 	CHANNEL_SIZE = 1000
+	RING_SIZE    = (1 << 22) * 64 / (1 << 11) // 32K frames
 )
 
 // Packet represents a network packet with data and error
@@ -65,6 +66,7 @@ type Metrics struct {
 	TxRate    uint64
 	lastRx    uint64
 	lastTx    uint64
+	buffer    int
 	timestamp time.Time
 }
 
@@ -93,14 +95,24 @@ func bToMb(b uint64) uint64 {
 	return b / 1024 / 1024
 }
 
+func getGrowingBuffer(size int) []byte {
+	buf := bufferPool.Get().([]byte)
+	if cap(buf) < size {
+		updateMetrics(func(m *Metrics) {
+			m.buffer = size
+		})
+
+		// Return old buffer to pool
+		bufferPool.Put(buf)
+		// Create new larger buffer
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
 // Add this helper function
 func (r *RawReceiver) forwardPacket(packetData []byte, header *unix.TpacketHdr) {
-	data := bufferPool.Get().([]byte)
-	if cap(data) < len(packetData) {
-		data = make([]byte, len(packetData))
-	} else {
-		data = data[:len(packetData)]
-	}
+	data := getGrowingBuffer(len(packetData))
 	copy(data, packetData)
 	r.packets <- Packet{Data: data}
 	header.Status = unix.TP_STATUS_KERNEL
@@ -113,14 +125,44 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		return nil, fmt.Errorf("error getting interface: %v", err)
 	}
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_ALL)))
+	const ETH_P_IXIA_CAPTURE = 0x5FFF
+	//fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_ALL)))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_IXIA_CAPTURE)))
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
 
+	// if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting SO_BROADCAST: %v", err)
+	// }
+
+	// if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_AUXDATA, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting PACKET_AUXDATA: %v", err)
+	// }
+
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1024*1024); err != nil {
+		return nil, fmt.Errorf("error setting SO_RCVBUF: %v", err)
+	}
+
+	// if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_RECVHOPOPTS, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting IPV6_RECVHOPOPTS: %v", err)
+	// }
+
+	// if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, ETH_P_IXIA_CAPTURE, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting ETH_P_IXIA_CAPTURE: %v", err)
+	// }
+
+	// if err := unix.SetsockoptInt(fd, unix.SOL_IPV6, unix.IPV6_RECVPKTINFO, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting IPV6_RECVPKTINFO: %v", err)
+	// }
+
+	// if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_RECVHOPLIMIT, 1); err != nil {
+	// 	return nil, fmt.Errorf("error setting IPV6_RECVHOPLIMIT: %v", err)
+	// }
+
 	sll := unix.SockaddrLinklayer{
 		Ifindex:  iface.Index,
-		Protocol: HostToNetShort(ETH_P_ALL),
+		Protocol: HostToNetShort(ETH_P_IXIA_CAPTURE),
 	}
 	if err := unix.Bind(fd, &sll); err != nil {
 		unix.Close(fd)
@@ -132,7 +174,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		Block_size: 1 << 22, // 4 MiB
 		Block_nr:   64,
 		Frame_size: 1 << 11, // 2 KiB
-		Frame_nr:   (1 << 22) * 64 / (1 << 11),
+		Frame_nr:   RING_SIZE,
 	}
 	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_RX_RING, req); err != nil {
 		unix.Close(fd)
@@ -223,11 +265,10 @@ func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
 						continue
 					}
 
-					packetDataBuffer := make([]byte, BUFFER_SIZE)
-
 					// Get the actual packet data starting from MAC header
 					macOffset := uint32(header.Mac)
 					packetLen := uint32(header.Len)
+					packetDataBuffer := getGrowingBuffer(int(packetLen))
 					packetData := packetDataBuffer[:packetLen]
 					copy(packetData, frame[macOffset:macOffset+packetLen])
 
@@ -357,7 +398,8 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					"Tx Rate   : %d\n"+
 					"IPv6      : %d\n"+
 					"Multicast : %d\n"+
-					"Broadcast : %d\n",
+					"Broadcast : %d\n"+
+					"Buffer    : %d\n",
 					os.Args,
 					metrics.RxFrames,
 					metrics.RxFilter,
@@ -368,7 +410,8 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 					metrics.TxRate,
 					metrics.IPv6,
 					metrics.Multicast,
-					metrics.Broadcast)
+					metrics.Broadcast,
+					metrics.buffer)
 				metricsMutex.Unlock()
 			}
 		}
@@ -408,6 +451,10 @@ func main() {
 
 	packets := make(chan Packet, CHANNEL_SIZE)
 
+	updateMetrics(func(m *Metrics) {
+		m.buffer = BUFFER_SIZE
+	})
+
 	receiver, err := NewRawReceiver(*src_iface, packets, filter, *filter_offset, *bmcast)
 	if err != nil {
 		log.Fatalf("Error creating receiver: %v", err)
@@ -424,7 +471,7 @@ func main() {
 		Block_size: 1 << 22, // 4 MiB
 		Block_nr:   64,
 		Frame_size: 1 << 11, // 2 KiB
-		Frame_nr:   (1 << 22) * 64 / (1 << 11),
+		Frame_nr:   RING_SIZE,
 	})
 	sender.Start(ctx)
 
