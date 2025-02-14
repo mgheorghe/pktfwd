@@ -139,6 +139,12 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
+	// Add cleanup in case of errors
+	defer func() {
+		if err != nil {
+			unix.Close(fd)
+		}
+	}()
 
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 1024*1024); err != nil {
 		return nil, fmt.Errorf("error setting SO_RCVBUF: %v", err)
@@ -149,7 +155,6 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		Protocol: HostToNetShort(ETH_P_ALL),
 	}
 	if err := unix.Bind(fd, &sll); err != nil {
-		unix.Close(fd)
 		return nil, fmt.Errorf("error binding socket: %v", err)
 	}
 
@@ -161,16 +166,20 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		Frame_nr:   RING_SIZE,
 	}
 	if err := unix.SetsockoptTpacketReq(fd, unix.SOL_PACKET, unix.PACKET_RX_RING, req); err != nil {
-		unix.Close(fd)
 		return nil, fmt.Errorf("error setting up packet ring: %v", err)
 	}
 
 	// Set up mmap for zero-copy
 	packetBuffer, err := unix.Mmap(fd, 0, int(req.Block_size*req.Block_nr), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		unix.Close(fd)
 		return nil, fmt.Errorf("error setting up mmap: %v", err)
 	}
+	// Add cleanup in case of errors
+	defer func() {
+		if err != nil {
+			unix.Munmap(packetBuffer)
+		}
+	}()
 
 	return &RawReceiver{
 		fd:           fd,
@@ -181,6 +190,16 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 		filterOffset: filterOffset,
 		packetBuffer: packetBuffer,
 	}, nil
+}
+
+func (r *RawReceiver) Close() error {
+	if err := unix.Munmap(r.packetBuffer); err != nil {
+		return fmt.Errorf("error unmapping packet buffer: %v", err)
+	}
+	if err := unix.Close(r.fd); err != nil {
+		return fmt.Errorf("error closing socket: %v", err)
+	}
+	return nil
 }
 
 // NewUDPSender creates UDP packet sender
