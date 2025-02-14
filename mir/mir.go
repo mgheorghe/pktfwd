@@ -233,6 +233,7 @@ var bufferPool = sync.Pool{
 
 // Start begins packet reception
 func (r *RawReceiver) Start(ctx context.Context, req *unix.TpacketReq) {
+	defer close(r.packets)
 	go func() {
 		log.Println("RawReceiver started")
 		for {
