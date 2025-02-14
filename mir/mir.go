@@ -23,7 +23,6 @@ import (
 
 // ETH_P_ALL captures all protocols
 const (
-	ETH_P_ALL    = 0x0003
 	BUFFER_SIZE  = 2048
 	CHANNEL_SIZE = 1000
 	RING_SIZE    = (1 << 22) * 64 / (1 << 11) // 32K frames
@@ -120,14 +119,18 @@ func (r *RawReceiver) forwardPacket(packetData []byte, header *unix.TpacketHdr) 
 
 // NewRawReceiver creates raw socket receiver
 func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filterOffset int, bmcast bool) (*RawReceiver, error) {
+	if runtime.GOARCH == "mips" || runtime.GOARCH == "mips64" {
+		const ETH_P_ALL = 0x5FFF
+	} else {
+		const ETH_P_ALL = 0x0003
+	}
+
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("error getting interface: %v", err)
 	}
 
-	const ETH_P_IXIA_CAPTURE = 0x5FFF
-	//fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_ALL)))
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_IXIA_CAPTURE)))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(HostToNetShort(ETH_P_ALL)))
 	if err != nil {
 		return nil, fmt.Errorf("error creating socket: %v", err)
 	}
@@ -162,7 +165,7 @@ func NewRawReceiver(ifaceName string, packets chan<- Packet, filter []byte, filt
 
 	sll := unix.SockaddrLinklayer{
 		Ifindex:  iface.Index,
-		Protocol: HostToNetShort(ETH_P_IXIA_CAPTURE),
+		Protocol: HostToNetShort(ETH_P_ALL),
 	}
 	if err := unix.Bind(fd, &sll); err != nil {
 		unix.Close(fd)
