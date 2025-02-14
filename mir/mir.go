@@ -421,6 +421,29 @@ func startMetricsReporter(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+const (
+	METRICS_BUFFER_SIZE = 1000
+)
+
+var metricsUpdateChan = make(chan func(*Metrics), METRICS_BUFFER_SIZE)
+
+func startMetricsProcessor() {
+	go func() {
+		for update := range metricsUpdateChan {
+			metricsMutex.Lock()
+			update(&metrics)
+			metricsMutex.Unlock()
+		}
+	}()
+}
+
+func queueMetricsUpdate(f func(*Metrics)) {
+	select {
+	case metricsUpdateChan <- f:
+	default:
+	}
+}
+
 func main() {
 	fmt.Println("Starting packet forwarder...")
 
@@ -452,6 +475,8 @@ func main() {
 
 	packets := make(chan Packet, CHANNEL_SIZE)
 
+	startMetricsProcessor()
+
 	updateMetrics(func(m *Metrics) {
 		m.buffer = BUFFER_SIZE
 	})
@@ -476,7 +501,6 @@ func main() {
 	})
 	sender.Start(ctx)
 
-	// Start metrics reporter (prints every 1 seconds)
 	if *metrics_enabled {
 		startMetricsReporter(ctx, time.Second)
 	}
@@ -484,7 +508,6 @@ func main() {
 	<-sigs
 	fmt.Println("Received SIGINT. Exiting...")
 
-	// Print memory statistics
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 	fmt.Printf("Alloc = %v MiB", bToMb(memStats.Alloc))
